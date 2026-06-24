@@ -1,0 +1,9 @@
+# Environment config (contains passwords)
+.env
+
+# Session data
+muse_sessions/
+
+# Python
+__pycache__/
+*.pyc

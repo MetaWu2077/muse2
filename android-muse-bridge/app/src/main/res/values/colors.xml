@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="zen_bg">#0F172A</color>
+    <color name="zen_card">#1E293B</color>
+    <color name="zen_primary">#818CF8</color>
+    <color name="zen_accent">#2DD4BF</color>
+    <color name="zen_warning">#FB7185</color>
+    <color name="zen_text_main">#F8FAFC</color>
+    <color name="zen_text_secondary">#94A3B8</color>
+
+    <!-- Legacy support if needed -->
+    <color name="primary">#818CF8</color>
+    <color name="primary_dark">#4F46E5</color>
+    <color name="accent">#2DD4BF</color>
+    <color name="background">#0F172A</color>
+    <color name="on_background">#F8FAFC</color>
+    <color name="signal_good">#2DD4BF</color>
+    <color name="signal_ok">#FBBF24</color>
+    <color name="signal_bad">#FB7185</color>
+    <color name="signal_off">#475569</color>
+</resources>

@@ -1,0 +1,6 @@
+muselsl>=2.4.0
+pylsl>=1.16.0
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.6.0
+python-osc>=1.8.0

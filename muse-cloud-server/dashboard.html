@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Muse Cloud - 数据仪表盘</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1923; color: #e0e0e0; min-height: 100vh; }
+.header { background: #1a2d3d; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #2d5f8a; }
+.header h1 { font-size: 20px; color: #ff6d00; }
+.status { font-size: 12px; padding: 4px 12px; border-radius: 12px; }
+.status.ok { background: #1b5e20; color: #81c784; }
+.status.err { background: #5e1b1b; color: #ef9a9a; }
+.container { display: flex; height: calc(100vh - 57px); overflow: hidden; }
+.sidebar { width: 320px; min-width: 280px; max-height: 100%; background: #15232e; display: flex; flex-direction: column; border-right: 1px solid #2a3f4f; }
+.sidebar h3 { padding: 16px; font-size: 14px; color: #78909c; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #2a3f4f; flex-shrink: 0; flex-grow: 0; }
+#sessionList { flex: 1 1 0; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #2a3f4f #0f1923; }
+#sessionList::-webkit-scrollbar { width: 6px; }
+#sessionList::-webkit-scrollbar-track { background: #0f1923; }
+#sessionList::-webkit-scrollbar-thumb { background: #2a3f4f; border-radius: 3px; }
+.main { flex: 1; overflow-y: auto; padding: 24px; }
+.session-item { padding: 12px 16px; cursor: pointer; border-bottom: 1px solid #1a2d3d; transition: background .15s; }
+.session-item:hover { background: #1e3343; }
+.session-item.active { background: #1a3a52; border-left: 3px solid #4fc3f7; }
+.session-item .name { font-size: 14px; font-weight: 600; }
+.session-item .meta { font-size: 11px; color: #78909c; margin-top: 4px; }
+.session-item .pkts { font-size: 11px; color: #81c784; }
+.main { flex: 1; overflow-y: auto; padding: 24px; }
+.card { background: #15232e; border-radius: 8px; padding: 20px; margin-bottom: 20px; border: 1px solid #2a3f4f; }
+.card h2 { font-size: 16px; color: #4fc3f7; margin-bottom: 16px; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+.stat { background: #0f1923; border-radius: 6px; padding: 14px; text-align: center; }
+.stat .value { font-size: 28px; font-weight: 700; color: #4fc3f7; }
+.stat .label { font-size: 11px; color: #78909c; margin-top: 4px; text-transform: uppercase; }
+.chart-wrap { position: relative; height: 280px; }
+.chart-wrap canvas { width: 100% !important; }
+.empty { text-align: center; padding: 60px 20px; color: #546e7a; }
+.empty .icon { font-size: 48px; margin-bottom: 12px; }
+.btn { display: inline-block; padding: 8px 16px; border-radius: 4px; text-decoration: none; font-size: 13px; cursor: pointer; border: none; }
+.btn-primary { background: #2d5f8a; color: #fff; }
+.btn-primary:hover { background: #3a77a8; }
+.btn-sm { padding: 4px 10px; font-size: 11px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; padding: 8px 12px; color: #78909c; font-weight: 500; border-bottom: 1px solid #2a3f4f; }
+td { padding: 8px 12px; border-bottom: 1px solid #1a2d3d; }
+.loading { text-align: center; padding: 40px; color: #78909c; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🧠 Muse Cloud — 数据仪表盘</h1>
+  <span id="health" class="status err">连接中...</span>
+</div>
+
+<div class="container">
+  <div class="sidebar">
+    <h3>📋 会话列表</h3>
+    <div id="sessionList"><div class="loading">加载中...</div></div>
+  </div>
+
+  <div class="main" id="mainPanel">
+    <div class="empty">
+      <div class="icon">📊</div>
+      <p>选择一个会话查看数据</p>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+
+function $(id) { return document.getElementById(id); }
+
+async function fetchJSON(url) {
+  const resp = await fetch(API + url);
+  if (!resp.ok) throw new Error(`${resp.status}`);
+  return resp.json();
+}
+
+// ── Health Check ──────────────────────────────────────
+async function checkHealth() {
+  try {
+    const h = await fetchJSON('/health');
+    $('health').textContent = h.db_connected ? '数据库已连接' : '文件模式';
+    $('health').className = 'status ' + (h.db_connected ? 'ok' : 'err');
+  } catch(e) {
+    $('health').textContent = '服务器离线';
+    $('health').className = 'status err';
+  }
+}
+
+// ── Session List ──────────────────────────────────────
+let sessionData = [];
+let activeDetailSid = null;
+let detailRefreshTimer = null;
+
+async function loadSessions() {
+  try {
+    const sessions = await fetchJSON('/api/sessions?limit=500');
+    sessionData = sessions;
+    const list = $('sessionList');
+    if (!sessions.length) {
+      list.innerHTML = '<div class="empty"><p>暂无会话</p></div>';
+      return;
+    }
+    // If the session being detailed is no longer active, stop auto-refresh
+    if (activeDetailSid && !sessions.find(s => s.session_id === activeDetailSid && s.active)) {
+      if (detailRefreshTimer) { clearInterval(detailRefreshTimer); detailRefreshTimer = null; }
+      activeDetailSid = null;
+    }
+
+    list.innerHTML = sessions.map(s => {
+      const live = s.active;
+      const dur = live ? liveDuration(s.started_at) : fmtDuration(s.started_at, s.ended_at);
+      const pktStr = s.total_packets > 0
+        ? `<span style="color:#81c784">${s.total_packets.toLocaleString()} 包</span>`
+        : '<span style="color:#546e7a">0 包</span>';
+      const sizeStr = (s.raw_file_size_bytes/1024).toFixed(1) + ' KB';
+      const badge = live
+        ? '<span style="display:inline-block;width:8px;height:8px;background:#ef5350;border-radius:50%;margin-right:6px;animation:pulse 1.5s ease-in-out infinite;"></span>'
+        : '';
+      return `
+        <div class="session-item" onclick="selectSession('${s.session_id}')" id="item-${s.session_id}">
+          <div class="name">${badge}${s.device_name}</div>
+          <div class="meta">${fmtTime(s.started_at)} · ${dur}</div>
+          <div class="pkts">${pktStr} · ${sizeStr}</div>
+        </div>`;
+    }).join('');
+  } catch(e) {
+    if (e.message === '503') {
+      $('sessionList').innerHTML = '<div class="empty"><p>数据库未连接<br><small>在 .env 中配置 MySQL 后重启</small></p></div>';
+    } else {
+      $('sessionList').innerHTML = '<div class="empty"><p>加载失败</p></div>';
+    }
+  }
+}
+
+function selectSession(sid) {
+  document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+  const item = document.getElementById('item-' + sid);
+  if (item) item.classList.add('active');
+
+  // Clear previous refresh timer
+  if (detailRefreshTimer) { clearInterval(detailRefreshTimer); detailRefreshTimer = null; }
+
+  // Check if session is active via cached sessionData
+  const info = sessionData.find(s => s.session_id === sid);
+  activeDetailSid = (info && info.active) ? sid : null;
+
+  // Load session detail in main panel + open report in new tab
+  loadSessionDetail(sid);
+
+  // Auto-refresh detail panel for active sessions
+  if (activeDetailSid) {
+    detailRefreshTimer = setInterval(() => loadSessionDetail(sid, true), 3000);
+  }
+}
+
+// ── Session Detail ────────────────────────────────────
+let chartInstances = {}; // Track Chart.js instances to avoid duplicates
+
+async function loadSessionDetail(sid, silent) {
+  const panel = $('mainPanel');
+  if (!silent) {
+    panel.innerHTML = '<div class="loading">加载中...</div>';
+    // Only open report on first click
+    window.open('/api/sessions/' + sid + '/report', '_blank');
+  }
+
+  try {
+    // Fetch live stats for active session, else regular detail
+    const isActive = (activeDetailSid === sid);
+    const [session, hrData, bpData] = await Promise.all([
+      isActive
+        ? fetchJSON('/api/sessions/' + sid + '/live').catch(() => fetchJSON('/api/sessions/' + sid))
+        : fetchJSON('/api/sessions/' + sid),
+      fetchJSON('/api/sessions/' + sid + '/heartrate').catch(() => []),
+      fetchJSON('/api/sessions/' + sid + '/bandpower').catch(() => []),
+    ]);
+
+    // Build stats HTML
+    const liveBadge = isActive
+      ? '<span style="color:#ef5350;font-size:12px;margin-left:8px;">● 实时</span>'
+      : '';
+    const dur = isActive
+      ? (session.duration_seconds ? fmtSeconds(session.duration_seconds) : liveDuration(session.started_at))
+      : fmtDuration(session.started_at, session.ended_at);
+    const pktCount = session.packet_count !== undefined ? session.packet_count : session.total_packets;
+    const fileSize = session.file_size_bytes !== undefined ? session.file_size_bytes : session.raw_file_size_bytes;
+    const eegPkts = session.eeg_packets || 0;
+    const ppgPkts = session.ppg_packets || 0;
+    const imuPkts = session.imu_packets || 0;
+
+    // Only rebuild DOM on first load (not silent refresh)
+    if (!silent) {
+      panel.innerHTML = `
+        <div class="card" id="detailCard">
+          <h2>📋 会话详情${liveBadge}</h2>
+          <div class="stats-grid" id="liveStats">
+            <div class="stat"><div class="value" id="statPkts">${pktCount.toLocaleString()}</div><div class="label">总包数</div></div>
+            <div class="stat"><div class="value" id="statDur">${dur}</div><div class="label">时长</div></div>
+            <div class="stat"><div class="value" id="statSize">${(fileSize/1024).toFixed(1)}</div><div class="label">文件大小 (KB)</div></div>
+            <div class="stat"><div class="value" id="statPreset">${session.preset}</div><div class="label">预设</div></div>
+          </div>
+          <table style="margin-top:16px;">
+            <tr><th>会话ID</th><td>${session.session_id}</td></tr>
+            <tr><th>设备</th><td>${session.device_name || '(unknown)'}</td></tr>
+            <tr><th>地址</th><td>${session.device_address || '-'}</td></tr>
+            <tr><th>开始</th><td>${fmtTime(session.started_at)}</td></tr>
+            <tr><th>结束</th><td>${fmtTime(session.ended_at)}</td></tr>
+            <tr id="detailRow" style="display:${isActive ? '' : 'none'}"><th>数据详情</th><td>EEG: ${eegPkts} · PPG: ${ppgPkts} · IMU: ${imuPkts}</td></tr>
+            <tr><th>原始文件</th><td><a class="btn btn-primary btn-sm" href="/api/sessions/${sid}/raw" download>下载 .bin 文件</a></td></tr>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>❤️ 心率</h2>
+          ${hrData.length ? '<div class="chart-wrap"><canvas id="hrChart"></canvas></div>' : '<div class="empty"><p>无心率数据（需要 PPG 传感器接触良好）</p></div>'}
+        </div>
+
+        <div class="card">
+          <h2>📊 EEG 频段能量</h2>
+          ${bpData.length ? '<div class="chart-wrap"><canvas id="bpChart"></canvas></div>' : '<div class="empty"><p>无频段能量数据</p></div>'}
+        </div>
+      `;
+
+      // Heart rate chart
+      if (hrData.length && document.getElementById('hrChart')) {
+        chartInstances.hr = new Chart(document.getElementById('hrChart'), {
+          type: 'line',
+          data: {
+            labels: hrData.map(r => r.time.substring(11,19)),
+            datasets: [{
+              label: 'BPM', data: hrData.map(r => r.bpm),
+              borderColor: '#ef5350', backgroundColor: 'rgba(239,83,80,0.1)',
+              fill: true, tension: 0.3, pointRadius: 0
+            }]
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            scales: {
+              x: { ticks: { color: '#78909c', maxTicksLimit: 20 } },
+              y: { min: 40, max: 200, ticks: { color: '#78909c' }, title: { display: true, text: 'BPM', color: '#78909c' } }
+            },
+            plugins: { legend: { display: false } }
+          }
+        });
+      }
+
+      // Band power chart
+      if (bpData.length && document.getElementById('bpChart')) {
+        const channels = [...new Set(bpData.map(r => r.channel))];
+        const datasets = channels.map((ch, i) => {
+          const colors = ['#4fc3f7','#81c784','#ffb74d','#e57373'];
+          const chData = bpData.filter(r => r.channel === ch);
+          return {
+            label: ch, data: chData.map(r => r.alpha),
+            borderColor: colors[i%4], fill: false, tension: 0.3, pointRadius: 0
+          };
+        });
+        chartInstances.bp = new Chart(document.getElementById('bpChart'), {
+          type: 'line',
+          data: {
+            labels: bpData.filter(r => r.channel === channels[0]).map(r => r.time.substring(11,19)),
+            datasets
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            scales: {
+              x: { ticks: { color: '#78909c', maxTicksLimit: 20 } },
+              y: { ticks: { color: '#78909c' }, title: { display: true, text: 'Alpha 频段能量', color: '#78909c' } }
+            }
+          }
+        });
+      }
+    } else {
+      // Silent refresh: update only the live stats numbers
+      const statPkts = document.getElementById('statPkts');
+      const statDur = document.getElementById('statDur');
+      const statSize = document.getElementById('statSize');
+      const detailRow = document.getElementById('detailRow');
+      if (statPkts) statPkts.textContent = pktCount.toLocaleString();
+      if (statDur) statDur.textContent = fmtSeconds(session.duration_seconds || 0);
+      if (statSize) statSize.textContent = (fileSize/1024).toFixed(1);
+      if (detailRow && isActive) detailRow.style.display = '';
+      if (detailRow && isActive) {
+        const td = detailRow.querySelector('td');
+        if (td) td.textContent = `EEG: ${eegPkts} · PPG: ${ppgPkts} · IMU: ${imuPkts}`;
+      }
+    }
+
+    // If session just became inactive, stop refreshing
+    if (!isActive && detailRefreshTimer) {
+      clearInterval(detailRefreshTimer);
+      detailRefreshTimer = null;
+      activeDetailSid = null;
+    }
+
+  } catch(e) {
+    if (!silent) {
+      panel.innerHTML = '<div class="empty"><p>加载失败: ' + e.message + '</p></div>';
+    }
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────
+function fmtTime(iso) {
+  if (!iso) return '-';
+  return new Date(iso).toLocaleString('zh-CN');
+}
+function fmtDuration(start, end) {
+  if (!start || !end) return '-';
+  const sec = (new Date(end) - new Date(start)) / 1000;
+  return fmtSeconds(sec);
+}
+function fmtSeconds(sec) {
+  if (sec < 0) return '-';
+  if (sec < 60) return Math.round(sec) + 's';
+  if (sec < 3600) return Math.round(sec/60) + 'm ' + Math.round(sec%60) + 's';
+  return Math.round(sec/3600) + 'h ' + Math.round((sec%3600)/60) + 'm';
+}
+function liveDuration(startIso) {
+  if (!startIso) return '-';
+  const sec = (new Date() - new Date(startIso)) / 1000;
+  return fmtSeconds(sec);
+}
+
+// ── Init ──────────────────────────────────────────────
+checkHealth();
+loadSessions();
+setInterval(checkHealth, 30000);
+setInterval(loadSessions, 15000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.MuseCloud" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- Primary brand color. -->
+        <item name="colorPrimary">@color/zen_primary</item>
+        <item name="colorPrimaryVariant">@color/primary_dark</item>
+        <item name="colorOnPrimary">@color/zen_text_main</item>
+        <!-- Secondary brand color. -->
+        <item name="colorSecondary">@color/zen_accent</item>
+        <item name="colorSecondaryVariant">@color/zen_accent</item>
+        <item name="colorOnSecondary">@color/zen_bg</item>
+        <!-- Status bar color. -->
+        <item name="android:statusBarColor">@color/zen_bg</item>
+        <!-- Customize your theme here. -->
+        <item name="android:windowBackground">@color/zen_bg</item>
+    </style>
+</resources>

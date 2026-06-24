@@ -1,0 +1,56 @@
+# Muse2 — EEG Headband Cloud Platform
+# ============================================================
+
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# ── Session data (large binary files) ───────────────────
+muse-cloud-server/muse_sessions/
+*.bin
+*.report.html
+
+# ── Secrets ─────────────────────────────────────────────
+.env
+muse-cloud-server/.env
+
+# ── Third-party binaries ────────────────────────────────
+BlueMuse_2.4.0.0/
+NeuroSkill_*.exe
+*.rar
+
+# ── Android build artifacts ─────────────────────────────
+android-muse-bridge/.gradle/
+android-muse-bridge/app/build/
+android-muse-bridge/local.properties
+android-muse-bridge/build/
+*.apk
+*.aab
+
+# ── IDE / OS ────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ── Test assets / scratch files ─────────────────────────
+a.bin
+*.png
+*.obj
+*.mtl
+*_faces.json
+*_verts.json
+head_faces.json
+head_verts.json
+free_head.*
+v4.obj
+.muse_battery.txt
+.muse_viewer_config.json
+BP_practice_data.rar
+
+# ── Temp / logs ─────────────────────────────────────────
+*.log
+ble_report/
