@@ -13,7 +13,7 @@ import datetime
 import logging
 
 try:
-    from scipy.signal import find_peaks
+    from scipy.signal import find_peaks, butter, filtfilt
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
@@ -193,7 +193,7 @@ class MuseRealtimeDecoder:
             decoded.packet_type = 'MULTI'
 
     def _calculate_heart_rate(self, decoded: DecodedData):
-        """Calculate heart rate from PPG buffer"""
+        """Calculate heart rate from PPG buffer (bandpass filter + peak detection)."""
         if len(self.ppg_buffer) < 128:  # Need at least 2 seconds
             return
 
@@ -203,16 +203,21 @@ class MuseRealtimeDecoder:
                 else self.ppg_buffer
             )
 
-            # Detrend
+            # Detrend and bandpass filter (0.7-4 Hz, matching report_generator)
             signal = signal - np.mean(signal)
+            sfreq = 64.0
+            nyq = sfreq / 2
+            b, a = butter(2, [0.7 / nyq, 4.0 / nyq], btype='band')
+            filtered = filtfilt(b, a, signal)
 
             if not SCIPY_AVAILABLE:
                 return
-            peaks, _ = find_peaks(signal, distance=40, prominence=np.std(signal) * 0.3)
+            peaks, _ = find_peaks(filtered, distance=int(sfreq * 0.35),
+                                  height=0.1 * np.std(filtered))
 
             if len(peaks) > 1:
-                peak_intervals = np.diff(peaks) / 64.0  # 64 Hz sampling
-                heart_rate = 60.0 / np.mean(peak_intervals)
+                peak_intervals = np.diff(peaks) / sfreq  # 64 Hz
+                heart_rate = 60.0 / np.median(peak_intervals)
 
                 if 40 < heart_rate < 200:  # Physiological range
                     decoded.heart_rate = heart_rate
