@@ -25,6 +25,12 @@ from collections import deque
 
 import numpy as np
 
+# Matplotlib imports (needed at module level for Figure)
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
 # ── Paths ─────────────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 AMUSED_DIR = os.path.join(SCRIPT_DIR, "amused-src")
@@ -43,11 +49,6 @@ def _ensure_imports():
     if _report_imports_done:
         return True
     try:
-        import matplotlib
-        matplotlib.use("TkAgg")
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        from matplotlib.figure import Figure
-        import matplotlib.pyplot as plt
         from scipy.signal import welch, butter, filtfilt, find_peaks
         global report_generator
         import report_generator
@@ -506,6 +507,12 @@ class MuseLocalServer(tk.Tk):
                                       fg="#78909c", bg="#1a2d3d", font=("", 10))
         self.status_label.pack(side=tk.LEFT, padx=(20, 0))
 
+        # Show current local IP prominently
+        local_ip = self._get_local_ip()
+        self.ip_label = tk.Label(header, text=f"🖥 {local_ip}:5000",
+                                  fg="#ffb74d", bg="#1a2d3d", font=("Consolas", 11, "bold"))
+        self.ip_label.pack(side=tk.LEFT, padx=(20, 0))
+
         self.pkt_var = tk.StringVar(value="Packets: 0")
         tk.Label(header, textvariable=self.pkt_var, fg="#546e7a",
                  bg="#1a2d3d", font=("", 9)).pack(side=tk.LEFT, padx=(20, 0))
@@ -645,7 +652,28 @@ class MuseLocalServer(tk.Tk):
             self.receiver.on("/muse/gyro", self._on_gyro)
             self.receiver.on("/muse/ppg", self._on_ppg)
             self.receiver.start()
-            self.bottom_label.config(text="Listening on UDP 0.0.0.0:5000 — waiting for data from Android...")
+
+            # Show local IP for easy Android config
+            local_ip = self._get_local_ip()
+            self.bottom_label.config(
+                text=f"Listening UDP 0.0.0.0:5000 | Local IP: {local_ip} | "
+                     f"Android: rebuild APK + toggle Local Mode ON")
+
+        self.btn_start.config(text="⏹ Stop", bg="#b71c1c")
+        self.btn_save.config(state=tk.NORMAL)
+        self.status_var.set("Recording")
+        self.status_label.config(fg="#81c784")
+
+    @staticmethod
+    def _get_local_ip():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "?.?.?.?"
 
         self.btn_start.config(text="⏹ Stop", bg="#b71c1c")
         self.btn_save.config(state=tk.NORMAL)
@@ -758,7 +786,11 @@ class MuseLocalServer(tk.Tk):
             dur = self.buffer.duration_seconds()
             self.dur_var.set(f"{int(dur//60):02d}:{int(dur%60):02d}")
             if self.receiver:
-                self.pkt_var.set(f"Packets: {self.receiver.packet_count}")
+                pkt = self.receiver.packet_count
+                self.pkt_var.set(f"Packets: {pkt}")
+                # Auto-start timer on first packet
+                if pkt > 0 and self.buffer.duration_seconds() < 0.5:
+                    pass  # timer already running from first sample
 
             self.canvas.draw_idle()
 
@@ -812,7 +844,20 @@ if __name__ == "__main__":
     parser.add_argument("--simulate", action="store_true", help="Demo with synthetic EEG")
     args = parser.parse_args()
 
-    app = MuseLocalServer(simulate=args.simulate)
     if not args.simulate:
-        app.receiver = UdpReceiver("0.0.0.0", args.port)
+        print("=" * 56)
+        print("  Muse Local Server")
+        print("  Listening: UDP 0.0.0.0:" + str(args.port))
+        print("  Waiting for Android OSC data (/muse/eeg, /muse/acc, ...)")
+        print()
+        print("  Android setup:")
+        print("    1. Rebuild APK with latest code")
+        print("    2. Install on phone")
+        print("    3. Turn ON 'Local Mode' switch")
+        print("    4. Connect to Muse S")
+        print()
+        print("  If no data: check Windows firewall allows UDP port " + str(args.port))
+        print("=" * 56)
+
+    app = MuseLocalServer(simulate=args.simulate)
     app.mainloop()

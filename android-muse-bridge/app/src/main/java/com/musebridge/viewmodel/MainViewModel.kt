@@ -267,8 +267,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.update { it.copy(cloudUrl = url) }
     }
 
-    fun updateOscTarget(host: String, port: Int) {
+    // Local mode target (configurable IP:port)
+    private var localHost = "192.168.2.5"
+    private var localPort = 5000
+
+    fun getLocalTarget(): String = "$localHost:$localPort"
+
+    fun updateLocalTarget(host: String, port: Int) {
+        localHost = host
+        localPort = port
         oscSender.configure(host, port)
+        if (oscSender.isRunning) {
+            oscSender.stop()
+            oscSender.start()
+        }
+        appendLog("Local target: $host:$port")
     }
 
     fun updateOscTarget(host: String, port: Int) {
@@ -281,9 +294,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun setLocalMode(enabled: Boolean) {
         if (enabled) {
-            updateOscTarget("192.168.2.5", 5000)
+            updateOscTarget(localHost, localPort)
             oscSender.start()
-            appendLog("Local Mode: OSC → 192.168.2.5:5000")
+            appendLog("Local Mode: OSC → $localHost:$localPort")
         } else {
             oscSender.stop()
             appendLog("Local Mode: disabled")

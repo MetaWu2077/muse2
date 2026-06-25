@@ -192,26 +192,22 @@ async def ws_session(ws: WebSocket):
     Protocol:
       1. Phone sends hello JSON: {"type":"hello","device":"MuseS-xxx","preset":"p1034"}
       2. Server responds: {"type":"hello_ack","session_id":"abc123","server_time":"..."}
-      3. Phone sends binary frames at ~100/sec:
-           Byte 0:     0x01
-           Bytes 1-16: session_id (UTF-8, space-padded to 16)
-           Bytes 17-20: seq_num (uint32 big-endian)
-           Bytes 21+:   raw BLE payload
-      4. Phone sends heartbeat every 5s: {"type":"heartbeat","battery":85}
+      3. Phone sends binary frames at ~100/sec
+      4. Phone sends heartbeat every few seconds: {"type":"heartbeat"}
+      5. Phone sends session_end when meditation finishes: {"type":"session_end"}
+      6. Phone may send another hello to start a new session on the same connection
     """
-    await ws.accept()
-    session_ctx = None
-
-    try:
-        # ── Hello handshake ──
-        hello_raw = await ws.receive_text()
-        hello = json.loads(hello_raw)
+    async def _start_session_from_hello(hello: dict):
+        nonlocal session_ctx
+        if session_ctx is not None:
+            await session_manager.close_session(session_ctx.session_id)
+            session_ctx = None
 
         device_name = hello.get("device", "Unknown")
         device_address = hello.get("address", "")
         preset = hello.get("preset", "p1034")
 
-        session_ctx = session_manager.create_session(
+        ctx = session_manager.create_session(
             device_name=device_name,
             device_address=device_address,
             preset=preset,
@@ -219,12 +215,25 @@ async def ws_session(ws: WebSocket):
 
         ack = {
             "type": "hello_ack",
-            "session_id": session_ctx.session_id,
+            "session_id": ctx.session_id,
             "server_time": datetime.datetime.now().isoformat(),
         }
         await ws.send_text(json.dumps(ack))
-        logger.info("[%s] streaming started (device=%s)",
-                    session_ctx.session_id, device_name)
+        logger.info("[%s] streaming started (device=%s)", ctx.session_id, device_name)
+        return ctx
+
+    await ws.accept()
+    session_ctx = None
+
+    try:
+        # ── Hello handshake (first message) ──
+        hello_raw = await ws.receive_text()
+        hello = json.loads(hello_raw)
+        if hello.get("type") != "hello":
+            await ws.close(1008, "Expected hello")
+            return
+
+        session_ctx = await _start_session_from_hello(hello)
 
         # ── Main receive loop ──
         while True:
@@ -237,12 +246,47 @@ async def ws_session(ws: WebSocket):
                 if msg_type == "heartbeat":
                     await ws.send_text(json.dumps({"type": "pong"}))
 
+                elif msg_type == "hello":
+                    # New meditation session on an existing WebSocket connection
+                    session_ctx = await _start_session_from_hello(msg)
+
+                elif msg_type == "session_end":
+                    if session_ctx:
+                        ended_id = session_ctx.session_id
+                        summary = await session_manager.close_session(ended_id)
+                        session_ctx = None
+                        await ws.send_text(json.dumps({
+                            "type": "session_ended",
+                            "session_id": ended_id,
+                        }))
+                        if summary:
+                            logger.info("[%s] ended by client: %d pkts in %.0fs",
+                                       ended_id,
+                                       summary['packet_count'],
+                                       summary['duration_seconds'])
+                            bin_path = summary.get('file_info', {}).get('filepath', '')
+                            if bin_path and os.path.exists(bin_path):
+                                report_path = bin_path.replace('.bin', '.report.html')
+                                if report_path not in _ongoing_generations:
+                                    _ongoing_generations.add(report_path)
+                                    try:
+                                        asyncio.ensure_future(
+                                            asyncio.to_thread(
+                                                _generate_report_sync, bin_path, report_path
+                                            )
+                                        )
+                                    except Exception as e:
+                                        _ongoing_generations.discard(report_path)
+                                        logger.warning("[%s] report generation failed: %s",
+                                                        ended_id, e)
+
                 elif msg_type == "status":
-                    logger.debug("[%s] status: %s", session_ctx.session_id, msg)
+                    logger.debug("[%s] status: %s",
+                                 session_ctx.session_id if session_ctx else "?", msg)
 
             elif "bytes" in data:
                 raw = data["bytes"]
-                if len(raw) < 21:
+                if len(raw) < 21 or session_ctx is None:
                     continue
 
                 frame_type = raw[0]

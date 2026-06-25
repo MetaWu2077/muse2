@@ -184,10 +184,17 @@ class MainActivity : AppCompatActivity() {
         binding.switchLocalMode.setOnCheckedChangeListener { _, isChecked ->
             viewModel.setLocalMode(isChecked)
             if (isChecked) {
-                Toast.makeText(this, "Local Mode: sending to 192.168.2.5:5000", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Local Mode: sending to " + viewModel.getLocalTarget(),
+                    Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(this, "Cloud Mode: sending to server", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Cloud Mode", Toast.LENGTH_SHORT).show()
             }
+        }
+
+        // Tap the label to change local target IP
+        binding.switchLocalMode.setOnLongClickListener {
+            showLocalTargetDialog()
+            true
         }
     }
 
@@ -327,6 +334,31 @@ class MainActivity : AppCompatActivity() {
     private fun onDeviceSelected(device: BleDevice) {
         binding.rvDevices.visibility = View.GONE
         viewModel.connectToDevice(device)
+    }
+
+    private fun showLocalTargetDialog() {
+        val current = viewModel.getLocalTarget()
+        val parts = current.split(":")
+        val currentHost = parts.getOrElse(0) { "192.168.2.5" }
+        val currentPort = parts.getOrElse(1) { "5000" }
+
+        val input = android.widget.EditText(this)
+        input.setText(currentHost)
+        input.hint = "192.168.x.x"
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Local Target IP")
+            .setMessage("Enter the desktop IP shown in Muse Local Server header (orange text).\nPort: $currentPort")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val newHost = input.text.toString().trim()
+                if (newHost.isNotEmpty()) {
+                    viewModel.updateLocalTarget(newHost, currentPort.toIntOrNull() ?: 5000)
+                    Toast.makeText(this, "Target: $newHost:$currentPort", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun hasBlePermissions(): Boolean {
