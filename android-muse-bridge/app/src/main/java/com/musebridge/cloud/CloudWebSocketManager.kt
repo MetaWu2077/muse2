@@ -41,11 +41,10 @@ class CloudWebSocketManager(
 ) {
     companion object {
         private const val TAG = "CloudWS"
-        private const val MAX_BUFFER_SIZE = 3000       // ~30 seconds at 100 Hz
-        private const val HEARTBEAT_INTERVAL_MS = 2_000L   // Increased frequency to prevent timeouts
+        private const val MAX_BUFFER_SIZE = 15_000      // ~2.5 min at 100 Hz
+        private const val HEARTBEAT_INTERVAL_MS = 2_000L
         private const val RECONNECT_BASE_DELAY_MS = 1_000L
         private const val RECONNECT_MAX_DELAY_MS = 30_000L
-        private const val MAX_RECONNECT_ATTEMPTS = 10
     }
 
     // Configuration
@@ -64,6 +63,7 @@ class CloudWebSocketManager(
         private set
 
     private val started = AtomicBoolean(false)
+    private val forcingReconnect = AtomicBoolean(false)
     private var webSocket: WebSocket? = null
     private var client: OkHttpClient? = null
 
@@ -151,31 +151,34 @@ class CloudWebSocketManager(
 
     /**
      * Enqueue a raw BLE notification payload for cloud upload.
-     * Called from the BLE data handler (on any thread).
+     * @return true if sent immediately, false if buffered or dropped
      */
-    fun sendPacket(data: ByteArray) {
+    fun sendPacket(data: ByteArray): Boolean {
         if (!isConnected || sessionId.isEmpty()) {
-            // Buffer for later replay
-            while (buffer.size >= MAX_BUFFER_SIZE) {
-                buffer.poll()  // Drop oldest
-                dropCount++
-            }
-            buffer.offer(data)
-            return
+            bufferPacket(data)
+            return false
         }
 
-        // Drain buffer first (oldest first to maintain order)
         drainBuffer()
+        return sendBinaryFrame(data)
+    }
 
-        // Send directly
-        sendBinaryFrame(data)
+    private fun bufferPacket(data: ByteArray) {
+        while (buffer.size >= MAX_BUFFER_SIZE) {
+            buffer.poll()
+            dropCount++
+        }
+        buffer.offer(data)
     }
 
     private fun drainBuffer() {
         var drained = 0
         while (true) {
             val data = buffer.poll() ?: break
-            sendBinaryFrame(data)
+            if (!sendBinaryFrame(data)) {
+                bufferPacket(data)
+                break
+            }
             drained++
         }
         if (drained > 0) {
@@ -183,7 +186,7 @@ class CloudWebSocketManager(
         }
     }
 
-    private fun sendBinaryFrame(data: ByteArray) {
+    private fun sendBinaryFrame(data: ByteArray): Boolean {
         val seq = seqNum.incrementAndGet()
 
         // Build frame: [type:1][session_id:16][seq_num:4][payload:N]
@@ -210,10 +213,39 @@ class CloudWebSocketManager(
         val ws = webSocket
         if (ws != null) {
             val bs = Buffer().also { it.write(frame) }.readByteString()
-            ws.send(bs)
-            packetCount++
-        } else {
+            val sent = ws.send(bs)
+            if (sent) {
+                packetCount++
+                return true
+            }
+            Log.w(TAG, "ws.send() returned false — forcing reconnect")
             dropCount++
+            forceReconnect("send buffer full")
+            bufferPacket(data)
+            return false
+        }
+        dropCount++
+        return false
+    }
+
+    /**
+     * Detect zombie WebSocket (connected flag set but socket dead) and reconnect.
+     */
+    private fun forceReconnect(reason: String) {
+        if (!started.get()) return
+        if (!forcingReconnect.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                heartbeatJob?.cancel()
+                isConnected = false
+                sessionId = ""
+                try { webSocket?.cancel() } catch (_: Exception) {}
+                webSocket = null
+                onDisconnected?.invoke(reason)
+                scheduleReconnect()
+            } finally {
+                forcingReconnect.set(false)
+            }
         }
     }
 
@@ -238,6 +270,46 @@ class CloudWebSocketManager(
         sendJson(json)
     }
 
+    /**
+     * Tell the server to finalize the current session (on FINISH).
+     * WebSocket stays open; a new hello starts the next session.
+     */
+    fun endMeditationSession() {
+        if (!isConnected) {
+            sessionId = ""
+            seqNum.set(0)
+            return
+        }
+        val json = JSONObject().apply { put("type", "session_end") }
+        sendJson(json)
+        sessionId = ""
+        seqNum.set(0)
+        Log.i(TAG, "Sent session_end")
+    }
+
+    /**
+     * Request a new server session (on GO). Resets sequence numbers.
+     */
+    fun startMeditationSession() {
+        seqNum.set(0)
+        sessionId = ""
+        if (!isConnected) {
+            Log.w(TAG, "Cannot start session — not connected")
+            return
+        }
+        val hello = JSONObject().apply {
+            put("type", "hello")
+            put("device", deviceName)
+            put("preset", preset)
+        }
+        sendJson(hello)
+        Log.i(TAG, "Sent hello for new meditation session")
+    }
+
+    private fun sendHello() = startMeditationSession()
+
+    // kept for clarity — initial connect defers hello until meditation starts
+
     // ── OkHttp WebSocket Listener ───────────────────────────────
 
     private val wsListener = object : WebSocketListener() {
@@ -245,15 +317,9 @@ class CloudWebSocketManager(
             Log.i(TAG, "WebSocket opened: ${response.message}")
             isConnected = true
             reconnectAttempt = 0
+            sessionId = ""
 
-            // Send hello
-            val hello = JSONObject().apply {
-                put("type", "hello")
-                put("device", deviceName)
-                put("preset", preset)
-            }
-            sendJson(hello)
-
+            // Session is created on GO via startMeditationSession(), not on connect
             onConnected?.invoke()
             startHeartbeat()
         }
@@ -270,6 +336,9 @@ class CloudWebSocketManager(
                         // Drain any buffered packets now that we have a session
                         scope.launch { drainBuffer() }
                         onSessionReady?.invoke(sessionId)
+                    }
+                    "session_ended" -> {
+                        Log.i(TAG, "Server confirmed session end: ${msg.optString("session_id")}")
                     }
                     "pong" -> {
                         // Heartbeat acknowledged
@@ -341,19 +410,14 @@ class CloudWebSocketManager(
     // ── Reconnection ──────────────────────────────────────────
 
     private fun scheduleReconnect() {
-        if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
-            Log.e(TAG, "Reconnect attempts exhausted ($MAX_RECONNECT_ATTEMPTS)")
-            return
-        }
-
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             reconnectAttempt++
             val delayMs = minOf(
-                RECONNECT_BASE_DELAY_MS * (1L shl (reconnectAttempt - 1)),
+                RECONNECT_BASE_DELAY_MS * (1L shl minOf(reconnectAttempt - 1, 5)),
                 RECONNECT_MAX_DELAY_MS
             )
-            Log.i(TAG, "Reconnect $reconnectAttempt/$MAX_RECONNECT_ATTEMPTS in ${delayMs}ms")
+            Log.i(TAG, "Reconnect attempt $reconnectAttempt in ${delayMs}ms")
             delay(delayMs)
 
             if (started.get()) {

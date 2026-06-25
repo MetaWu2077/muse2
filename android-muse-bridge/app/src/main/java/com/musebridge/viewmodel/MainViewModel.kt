@@ -69,10 +69,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // Accumulate per-channel EEG data for signal quality calculation
     private val eegAccumulators = Array(5) { mutableListOf<Float>() }
 
-    // Keep device awake during streaming
+    // Keep device awake during streaming / meditation
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var releaseWakelocksJob: kotlinx.coroutines.Job? = null
+    private var sessionHadCloudIssues = false
 
     init {
         // Observe scanner devices
@@ -110,21 +111,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
                 // Manage wake locks based on connection state
                 when (state) {
-                    ConnectionState.STREAMING, ConnectionState.SUBSCRIBING -> {
+                    ConnectionState.STREAMING, ConnectionState.SUBSCRIBING,
+                    ConnectionState.CONNECTING, ConnectionState.CONNECTED -> {
                         acquireWakeLocks()
                         releaseWakelocksJob?.cancel(); releaseWakelocksJob = null
                     }
                     ConnectionState.DISCONNECTED -> {
-                        // Delay release by 60s to allow reconnect attempts.
-                        // If reconnected within the grace period, release is cancelled.
-                        scheduleWakelockRelease(60_000L)
+                        if (_uiState.value.isMeditating) {
+                            // Keep CPU/network alive during meditation reconnect
+                            acquireWakeLocks()
+                            releaseWakelocksJob?.cancel(); releaseWakelocksJob = null
+                            appendLog("WakeLock: held during meditation (BLE reconnecting)")
+                        } else {
+                            scheduleWakelockRelease(120_000L)
+                        }
                     }
                     ConnectionState.DISCONNECTING -> {
-                        // User-initiated disconnect — release now
-                        releaseWakelocksJob?.cancel()
-                        releaseWakeLocks()
+                        if (!_uiState.value.isMeditating) {
+                            releaseWakelocksJob?.cancel()
+                            releaseWakeLocks()
+                        }
                     }
-                    else -> { /* CONNECTING, SCANNING — keep current lock state */ }
+                    else -> { /* SCANNING — keep current lock state */ }
                 }
             }
         }
@@ -146,10 +154,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         cloudWs.onDisconnected = { reason ->
             _uiState.update { it.copy(cloudConnected = false, cloudSessionId = "") }
             appendLog("Cloud: disconnected ($reason)")
-            
-            // If we disconnect during meditation, we should continue saving locally
+            sessionHadCloudIssues = true
+
             if (_uiState.value.isMeditating) {
-                appendLog("Cloud lost during Zen. Saving locally...")
+                appendLog("Cloud lost during Zen — local backup continues")
             }
         }
         cloudWs.onSessionReady = { sid ->
@@ -263,35 +271,63 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         oscSender.configure(host, port)
     }
 
+    fun updateOscTarget(host: String, port: Int) {
+        oscSender.configure(host, port)
+    }
+
+    /**
+     * Toggle local mode: when enabled, start OSC sender targeting the desktop.
+     * When disabled, stop OSC sender (cloud WebSocket handles transmission).
+     */
+    fun setLocalMode(enabled: Boolean) {
+        if (enabled) {
+            updateOscTarget("192.168.2.5", 5000)
+            oscSender.start()
+            appendLog("Local Mode: OSC → 192.168.2.5:5000")
+        } else {
+            oscSender.stop()
+            appendLog("Local Mode: disabled")
+        }
+    }
+
     fun setMeditation(active: Boolean) {
         _uiState.update { it.copy(isMeditating = active, meditationDurationSeconds = 0) }
         appendLog("Meditation: ${if (active) "Started" else "Stopped"}")
 
         if (active) {
+            sessionHadCloudIssues = false
+            acquireWakeLocks()
             startTimer()
-            // Always start a local session as a safety backup
             storage.startSession()
-            
-            if (!_uiState.value.cloudConnected) {
-                appendLog("Server is offline. Saving locally...")
+
+            if (_uiState.value.cloudConnected) {
+                cloudWs.startMeditationSession()
+                appendLog("Cloud: requesting new session...")
             } else {
-                appendLog("Cloud streaming active.")
+                appendLog("Server is offline. Saving locally...")
             }
         } else {
             stopTimer()
             storage.endSession()
             appendLog("Zen session ended")
-            
-            // Clean up empty/tiny files (if everything went to cloud)
-            val files = storage.getPendingFiles()
-            if (files.isNotEmpty()) {
-                val lastFile = files.last()
-                if (lastFile.length() < 100) {
-                    storage.deleteFile(lastFile)
-                }
+
+            if (_uiState.value.cloudConnected) {
+                cloudWs.endMeditationSession()
+                _uiState.update { it.copy(cloudSessionId = "") }
+                appendLog("Cloud: session ended")
             }
-            
-            // Trigger background upload check
+
+            if (!sessionHadCloudIssues && _uiState.value.cloudConnected && cloudWs.dropCount == 0L) {
+                val files = storage.getPendingFiles()
+                if (files.isNotEmpty()) {
+                    storage.deleteFile(files.last())
+                    appendLog("Cloud OK — removed redundant local backup")
+                }
+            } else {
+                appendLog("Local backup retained (cloud drops=${cloudWs.dropCount})")
+            }
+
+            releaseWakeLocks()
             checkAndUploadOfflineData()
         }
     }
@@ -306,11 +342,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             if (pendingFiles.isEmpty()) return@launch
 
             appendLog("Found ${pendingFiles.size} offline sessions. Starting upload...")
-            
+
             for (file in pendingFiles) {
                 if (!isActive || !uiState.value.cloudConnected || uiState.value.isMeditating) break
-                
-                appendLog("Uploading ${file.name}...")
+
+                cloudWs.startMeditationSession()
+                // Wait for server to assign a session_id for this upload batch
+                var waited = 0
+                while (isActive && cloudWs.sessionId.isEmpty() && waited < 50) {
+                    delay(100)
+                    waited++
+                }
+                if (cloudWs.sessionId.isEmpty()) {
+                    appendLog("Upload aborted — no cloud session for ${file.name}")
+                    break
+                }
+
+                appendLog("Uploading ${file.name} to session ${cloudWs.sessionId}...")
                 FileInputStream(file).use { fis ->
                     var packet = storage.readNextPacket(fis)
                     while (packet != null && isActive && uiState.value.cloudConnected && !uiState.value.isMeditating) {
@@ -324,6 +372,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 if (isActive && !uiState.value.isMeditating) {
                     storage.deleteFile(file)
                     appendLog("Uploaded and deleted ${file.name}")
+                    cloudWs.endMeditationSession()
                 }
             }
             appendLog("Background upload complete.")
@@ -382,12 +431,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 appendLog("SENSOR: ${data.size}B, ${subpackets.size} subpkts")
             }
 
-            // ── Data Export: Cloud or Local ──
+            // ── Data Export: always local backup during meditation + cloud when available ──
             if (uiState.value.isMeditating) {
+                storage.savePacket(data)
                 if (uiState.value.cloudConnected && cloudWs.sessionId.isNotEmpty()) {
-                    cloudWs.sendPacket(data)
+                    if (!cloudWs.sendPacket(data)) {
+                        sessionHadCloudIssues = true
+                    }
                 } else {
-                    storage.savePacket(data)
+                    sessionHadCloudIssues = true
                 }
             }
 

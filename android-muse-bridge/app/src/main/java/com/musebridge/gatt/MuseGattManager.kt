@@ -256,7 +256,7 @@ class MuseGattManager(
         keepAliveJob?.cancel()
         keepAliveJob = scope.launch {
             while (isActive) {
-                delay(30_000L)  // every 30 seconds
+                delay(15_000L)  // every 15 seconds — prevent phone BLE idle timeout
                 try {
                     val g = gatt
                     if (g != null && _connectionState.value == ConnectionState.STREAMING) {

@@ -27,6 +27,7 @@ class StreamForegroundService : Service() {
         const val NOTIFICATION_ID = 1
         const val ACTION_STOP = "com.musebridge.STOP_STREAM"
         const val EXTRA_DEVICE_NAME = "device_name"
+        const val EXTRA_IS_MEDITATING = "is_meditating"
     }
 
     override fun onCreate() {
@@ -36,6 +37,14 @@ class StreamForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val deviceName = intent?.getStringExtra(EXTRA_DEVICE_NAME) ?: "Muse S"
+        val isMeditating = intent?.getBooleanExtra(EXTRA_IS_MEDITATING, false) ?: false
+
+        val title = if (isMeditating) "Muse Cloud — Zen Session" else "Muse Cloud — Streaming"
+        val text = if (isMeditating) {
+            "Recording $deviceName (screen off OK)"
+        } else {
+            "Connected to $deviceName"
+        }
 
         val stopIntent = Intent(this, MainActivity::class.java).apply {
             action = ACTION_STOP
@@ -55,8 +64,8 @@ class StreamForegroundService : Service() {
         )
 
         val notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Muse Cloud — Streaming")
-            .setContentText("Connected to $deviceName")
+            .setContentTitle(title)
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
             .setContentIntent(openPendingIntent)

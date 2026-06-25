@@ -19,6 +19,7 @@ import java.net.NetworkInterface
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -38,6 +39,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var viewModel: MainViewModel
     private lateinit var deviceAdapter: DeviceAdapter
+    private var autoConnectAttempted = false
 
     // Permission launchers
     private val blePermissionLauncher = registerForActivityResult(
@@ -67,7 +69,10 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        viewModel = MainViewModel(application)
+        viewModel = ViewModelProvider(
+            this,
+            ViewModelProvider.AndroidViewModelFactory.getInstance(application)
+        )[MainViewModel::class.java]
 
         setupDeviceList()
         setupButtons()
@@ -111,34 +116,31 @@ class MainActivity : AppCompatActivity() {
             Log.d("MainActivity", "Battery optimization already exempt")
         }
     }
-                .setPositiveButton("Allow") { _, _ ->
-                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = Uri.parse("package:$packageName")
-                    }
-                    startActivity(intent)
-                }
-                .setNegativeButton("Later", null)
-                .show()
-        } else {
-            Log.d("MainActivity", "Battery optimization already exempt")
-        }
-    }
 
     /**
-     * Start foreground service when streaming begins; stop when disconnected.
+     * Keep foreground service alive during meditation and BLE reconnect.
+     * Stopping on brief DISCONNECTED was causing Doze to kill network after ~20 min.
      */
     private fun updateForegroundService(state: com.musebridge.viewmodel.UiState) {
-        if (state.connectionState == ConnectionState.STREAMING) {
+        val needsService = state.isMeditating || state.connectionState in setOf(
+            ConnectionState.STREAMING,
+            ConnectionState.SUBSCRIBING,
+            ConnectionState.CONNECTING,
+            ConnectionState.CONNECTED
+        )
+
+        if (needsService) {
             val intent = Intent(this, StreamForegroundService::class.java).apply {
                 putExtra(StreamForegroundService.EXTRA_DEVICE_NAME,
                     state.connectedDeviceName.ifEmpty { "Muse S" })
+                putExtra(StreamForegroundService.EXTRA_IS_MEDITATING, state.isMeditating)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent)
             } else {
                 startService(intent)
             }
-        } else if (state.connectionState == ConnectionState.DISCONNECTED) {
+        } else if (state.connectionState == ConnectionState.DISCONNECTED && !state.isMeditating) {
             stopService(Intent(this, StreamForegroundService::class.java))
         }
     }
@@ -177,13 +179,27 @@ class MainActivity : AppCompatActivity() {
             binding.svLog.visibility = if (binding.svLog.visibility == View.VISIBLE) View.GONE else View.VISIBLE
             true
         }
+
+        // Local mode toggle — sends OSC to desktop instead of cloud
+        binding.switchLocalMode.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.setLocalMode(isChecked)
+            if (isChecked) {
+                Toast.makeText(this, "Local Mode: sending to 192.168.2.5:5000", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Cloud Mode: sending to server", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun observeState() {
         lifecycleScope.launch {
             viewModel.uiState.collectLatest { state ->
-                // AUTO-CONNECT: If scanning and found a device, connect immediately
-                if (state.connectionState == ConnectionState.DISCONNECTED && state.devices.isNotEmpty()) {
+                // Auto-connect once on first discovery; MuseGattManager handles reconnect internally
+                if (!autoConnectAttempted &&
+                    state.connectionState == ConnectionState.DISCONNECTED &&
+                    state.devices.isNotEmpty()
+                ) {
+                    autoConnectAttempted = true
                     onDeviceSelected(state.devices.first())
                 }
                 updateUi(state)
