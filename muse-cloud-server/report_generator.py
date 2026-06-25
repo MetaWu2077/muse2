@@ -25,10 +25,28 @@ BANDS = {"Delta": (0.5, 4), "Theta": (4, 8), "Alpha": (8, 12),
 CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
 SFREQ = 256.0
 
+# ── Epoch settings ─────────────────────────────────────────────────────
+EPOCH_SECONDS = 10    # Analysis window size (seconds)
+EPOCH_STEP = 5        # Step between windows (seconds), 50% overlap
+SMOOTH_POINTS = 3     # Moving average window for chart smoothing
+
 # ── Noise rejection threshold ──
 # If (beta + gamma) relative power exceeds this, the epoch is dominated
 # by EMG / white noise rather than real EEG → reject it.
 NOISE_BG_RATIO = 0.65  # beta+gamma > 65% of total = noise
+
+
+def moving_average(values, window=3):
+    """Simple centered moving average. Returns same-length array (edges use available points)."""
+    if len(values) < window:
+        return values
+    result = np.zeros(len(values))
+    half = window // 2
+    for i in range(len(values)):
+        start = max(0, i - half)
+        end = min(len(values), i + half + 1)
+        result[i] = np.nanmean(values[start:end])
+    return result
 
 
 def compute_band_power_chunk(data, sfreq):
@@ -195,20 +213,22 @@ def generate_report(bin_path: str, output_path: str) -> str:
     t0 = timestamps[0]
     tend = timestamps[-1]
     duration = tend - t0
-    n_minutes = max(1, int(np.ceil(duration / 60)))
+    epoch_step = EPOCH_STEP
+    epoch_width = EPOCH_SECONDS
+    n_epochs = max(1, int((duration - epoch_width) / epoch_step) + 1)
 
-    # ── Per-minute analysis ──
+    # ── Per-epoch analysis (sliding windows with overlap) ──
     rows = []
     noise_count = 0
     has_ppg = len(ppg_ir_arr) > 10
     has_hr = False
 
-    for m in range(n_minutes):
-        t_start = t0 + m * 60
-        t_end = t0 + (m + 1) * 60
+    for ep in range(n_epochs):
+        t_start = t0 + ep * epoch_step
+        t_end = t_start + epoch_width
         mask = (timestamps >= t_start) & (timestamps < t_end)
 
-        row = {"minute": m + 1}
+        row = {"minute": round((t_start - t0) / 60, 1)}
 
         # EEG band power
         eeg_chunk = eeg_arr[mask]
@@ -283,13 +303,20 @@ def generate_report(bin_path: str, output_path: str) -> str:
             row["state"] = "噪声 Noise"
         rows.append(row)
 
-    # ── Build charts ──
+    # ── Apply moving average smoothing to band powers ──
+    for band_key in ["delta_db", "theta_db", "alpha_db", "beta_db", "gamma_db", "theta_beta"]:
+        values = np.array([r.get(band_key, np.nan) for r in rows], dtype=float)
+        smoothed = moving_average(values, SMOOTH_POINTS)
+        for i, r in enumerate(rows):
+            r[band_key + "_smooth"] = float(smoothed[i]) if not np.isnan(smoothed[i]) else None
+
+    # ── Build charts (use smoothed values) ──
     minutes = [r["minute"] for r in rows]
 
     def n(val):
         return val if val is not None else np.nan
 
-    # Use dB values for charts
+    # Use smoothed dB values for charts
     colors = {"delta": "#888888", "theta": "#ffe66d", "alpha": "#4ecdc4",
               "beta": "#ff6b6b", "gamma": "#a37eba",
               "theta_beta": "#ff8c42", "hr": "#ff4444",
@@ -314,7 +341,7 @@ def generate_report(bin_path: str, output_path: str) -> str:
         ax.spines["right"].set_visible(False)
         ax.grid(True, color="#222", linewidth=0.3)
 
-    vals = {k: [n(r[k + "_db"]) for r in rows] for k in ["delta", "theta", "alpha", "beta", "gamma"]}
+    vals = {k: [n(r[k + "_db_smooth"]) for r in rows] for k in ["delta", "theta", "alpha", "beta", "gamma"]}
     for band, label in [("delta", "δ Delta"), ("theta", "θ Theta"),
                          ("alpha", "α Alpha"), ("beta", "β Beta"),
                          ("gamma", "γ Gamma")]:
@@ -331,14 +358,14 @@ def generate_report(bin_path: str, output_path: str) -> str:
             ax1.axvspan(r["minute"] - 0.5, r["minute"] + 0.5,
                         facecolor="#ff0000", alpha=0.08)
 
-    # Theta/Beta ratio (linear)
-    tb = [n(r["theta_beta"]) for r in rows]
+    # Theta/Beta ratio (linear, smoothed)
+    tb = [n(r["theta_beta_smooth"]) for r in rows]
     ax2.fill_between(minutes, 0, tb, color=colors["theta_beta"], alpha=0.3)
     ax2.plot(minutes, tb, color=colors["theta_beta"], linewidth=2, marker="s", markersize=5)
     ax2.axhline(y=1.0, color="#666", linewidth=0.8, linestyle="--")
     ax2.axhline(y=2.0, color="#666", linewidth=0.8, linestyle="--")
     ax2.set_ylabel("θ/β Ratio", color="#ccc")
-    ax2.set_xlabel("Minute", color="#ccc")
+    ax2.set_xlabel("Time (min)", color="#ccc")
     ax2.set_title("Theta/Beta Ratio", color="#ccc", fontweight="bold")
     ax2.set_ylim(bottom=0)
     chart1 = fig_to_b64(fig1)
@@ -395,9 +422,9 @@ def generate_report(bin_path: str, output_path: str) -> str:
     fig3, ax3 = plt.subplots(figsize=(10, 2.5))
     fig3.patch.set_facecolor("#0f0f11")
     ax3.set_facecolor("#0f0f11")
-    ax3.set_ylim(0, 1); ax3.set_xlim(0, n_minutes)
+    ax3.set_ylim(0, 1); ax3.set_xlim(0, n_epochs)
     ax3.set_yticks([])
-    ax3.set_xlabel("Minute", color="#ccc")
+    ax3.set_xlabel("Time (epoch)", color="#ccc")
     ax3.set_title("Brain State Timeline (red = noise rejected)", color="#ccc", fontweight="bold")
     ax3.tick_params(colors="#888888")
     for s in ax3.spines.values(): s.set_visible(False)
@@ -427,25 +454,30 @@ def generate_report(bin_path: str, output_path: str) -> str:
     avg_beta  = np.nanmean([r["beta_db"]  for r in src if r["beta_db"] is not None]) if src else 0
     avg_theta = np.nanmean([r["theta_db"] for r in src if r["theta_db"] is not None]) if src else 0
     avg_tb = np.nanmean([r["theta_beta"] for r in src if r["theta_beta"] is not None]) if src else 0
-    avg_hr = np.nanmean([r["hr"] for r in rows if r["hr"] is not None])
-    clean_pct = 100 * (n_minutes - noise_count) / max(n_minutes, 1)
+    avg_hr = np.nanmean([r["hr"] for r in rows if r["hr"] is not None]) if any(r["hr"] is not None for r in rows) else float('nan')
+    clean_pct = 100 * (n_epochs - noise_count) / max(n_epochs, 1)
 
-    # ── Per-minute table ──
+    # ── Per-epoch table ──
     table_rows = ""
     for r in rows:
         def vd(val):
             return f"{val:.1f} dB" if val is not None else "-"
         def vr(val):
-            return f"{val:.3f}" if val is not None else "-"
+            return f"{val:.2f}" if val is not None else "-"
         hr_str = f"{r['hr']:.0f}" if r["hr"] else "-"
         acc_str = f"{r['acc_mag']:.3f}" if r["acc_mag"] is not None else "-"
         sc = state_colors.get(r["state"], "#888")
         noise_mark = " ⚠" if r.get("noise") else ""
+        time_label = f"{r['minute']:.1f}m"
         table_rows += f"""<tr>
-            <td>{r['minute']}{noise_mark}</td>
-            <td>{vd(r['delta_db'])}</td><td>{vd(r['theta_db'])}</td><td>{vd(r['alpha_db'])}</td>
-            <td>{vd(r['beta_db'])}</td><td>{vd(r['gamma_db'])}</td>
-            <td>{vr(r['theta_beta'])}</td><td>{hr_str}</td><td>{acc_str}</td>
+            <td>{time_label}{noise_mark}</td>
+            <td>{vd(r.get('delta_db_smooth', r.get('delta_db')))}</td>
+            <td>{vd(r.get('theta_db_smooth', r.get('theta_db')))}</td>
+            <td>{vd(r.get('alpha_db_smooth', r.get('alpha_db')))}</td>
+            <td>{vd(r.get('beta_db_smooth', r.get('beta_db')))}</td>
+            <td>{vd(r.get('gamma_db_smooth', r.get('gamma_db')))}</td>
+            <td>{vr(r.get('theta_beta_smooth', r.get('theta_beta')))}</td>
+            <td>{hr_str}</td><td>{acc_str}</td>
             <td style="color:{sc};font-weight:bold;">{r['state']}</td>
         </tr>"""
 
@@ -455,9 +487,10 @@ def generate_report(bin_path: str, output_path: str) -> str:
     noise_html = ""
     if noise_count > 0:
         noise_html = f"""<div class="summary">
-    <div style="border:1px solid #ef5350;"><span class="label">⚠ 噪声分钟</span><br>
-        <span class="value" style="color:#ef5350;">{noise_count}/{n_minutes}</span></div>
+    <div style="border:1px solid #ef5350;"><span class="label">⚠ 噪声 epoch</span><br>
+        <span class="value" style="color:#ef5350;">{noise_count}/{n_epochs}</span></div>
     <div><span class="label">干净数据占比</span><br><span class="value">{clean_pct:.0f}%</span></div>
+    <div><span class="label">Epoch</span><br><span class="value">{EPOCH_SECONDS}s</span></div>
 </div>"""
 
     html = f"""<!DOCTYPE html>
@@ -508,15 +541,16 @@ img {{ max-width:100%; border:1px solid #333; border-radius:4px; }}
 
 <h2>4. Per-Minute Data</h2>
 <table>
-<tr><th>Min</th><th>Delta</th><th>Theta</th><th>Alpha</th><th>Beta</th><th>Gamma</th><th>TB-Ratio</th><th>HR</th><th>ACC</th><th>State</th></tr>
+<tr><th>Time</th><th>Delta</th><th>Theta</th><th>Alpha</th><th>Beta</th><th>Gamma</th><th>TB-Ratio</th><th>HR</th><th>ACC</th><th>State</th></tr>
 {table_rows}
 </table>
 
 <p class="note">
     Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}<br>
-    Y-axis: dB = 10×log₁₀(μV²) — absolute power referenced to 1 μV²<br>
+    Epoch: {EPOCH_SECONDS}s window, {EPOCH_STEP}s step, {SMOOTH_POINTS}-point moving average<br>
+    Y-axis: dB = 10×log<sub>10</sub>(μV²) — absolute power referenced to 1 μV²<br>
     Bands: Delta 0.5-4Hz | Theta 4-8Hz | Alpha 8-12Hz | Beta 12-30Hz | Gamma 30-45Hz<br>
-    Noise rejection: epochs where Beta+Gamma &gt; {NOISE_BG_RATIO*100:.0f}% of total power are marked ⚠ and excluded from averages
+    Noise: epochs where Beta+Gamma &gt; {NOISE_BG_RATIO*100:.0f}% of total power are marked ⚠ and excluded from averages
 </p>
 </body></html>"""
 
