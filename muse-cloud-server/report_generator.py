@@ -25,8 +25,20 @@ BANDS = {"Delta": (0.5, 4), "Theta": (4, 8), "Alpha": (8, 12),
 CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
 SFREQ = 256.0
 
+# ── Noise rejection threshold ──
+# If (beta + gamma) relative power exceeds this, the epoch is dominated
+# by EMG / white noise rather than real EEG → reject it.
+NOISE_BG_RATIO = 0.65  # beta+gamma > 65% of total = noise
+
 
 def compute_band_power_chunk(data, sfreq):
+    """Compute absolute band power in dB (10*log10(μV²)) per channel.
+
+    Returns:
+        dict with keys 'db' (dict band→dB array), 'rel' (dict band→relative array),
+        'noise' (bool array per channel), 'total_db' (array of total power in dB)
+        or None if data insufficient.
+    """
     if data.shape[0] < int(sfreq * 0.5):
         return None
     nperseg = int(sfreq * 1)
@@ -34,17 +46,35 @@ def compute_band_power_chunk(data, sfreq):
         freqs, psd = welch(data, sfreq, nperseg=nperseg, axis=0)
     except Exception:
         return None
-    result = {}
-    total = np.zeros(data.shape[1])
+
+    n_chan = data.shape[1]
+    abs_power = {}  # band → μV² array
+    total = np.zeros(n_chan)
+
     for band, (lo, hi) in BANDS.items():
         mask = (freqs >= lo) & (freqs <= hi)
-        bp = np.trapezoid(psd[mask], freqs[mask], axis=0)
-        result[band] = bp
+        bp = np.trapezoid(psd[mask], freqs[mask], axis=0)  # μV²
+        abs_power[band] = np.maximum(bp, 1e-12)  # floor to avoid log(0)
         total += bp
+
+    # Relative power (for noise detection)
+    total_safe = np.maximum(total, 1e-12)
     rel = {}
     for band in BANDS:
-        rel[band] = result[band] / total
-    return rel
+        rel[band] = abs_power[band] / total_safe
+
+    # Noise flag: beta+gamma relative > threshold → EMG/white noise dominated
+    bg_rel = rel["Beta"] + rel["Gamma"]
+    is_noise = bg_rel > NOISE_BG_RATIO
+
+    # Absolute dB: 10*log10(μV²)  (reference 1 μV²)
+    db = {}
+    for band in BANDS:
+        db[band] = 10.0 * np.log10(abs_power[band])
+
+    total_db = 10.0 * np.log10(total_safe)
+
+    return {"db": db, "rel": rel, "noise": is_noise, "total_db": total_db}
 
 
 def compute_hr_chunk(ppg, sfreq=64.0):
@@ -61,13 +91,15 @@ def compute_hr_chunk(ppg, sfreq=64.0):
     return None
 
 
-def classify_state(alpha, theta, beta, theta_beta, hr):
-    if alpha is not None and alpha > 0.25:
-        return "放松 Relaxed"
-    if theta_beta is not None and theta_beta > 1.5:
-        return "冥想 Meditative"
-    if beta is not None and beta > 0.30:
-        return "专注 Focused"
+def classify_state(alpha, theta, beta, delta, theta_beta_ratio, hr):
+    """Classify brain state from band powers in dB. All band inputs are in dB."""
+    if alpha is not None and theta is not None and beta is not None:
+        if alpha > theta and alpha > beta and alpha > 5:
+            return "放松 Relaxed"
+        if theta_beta_ratio is not None and theta_beta_ratio > 2.0:
+            return "冥想 Meditative"
+        if beta is not None and beta > 5 and beta > alpha:
+            return "专注 Focused"
     if hr is not None and hr > 90:
         return "活跃 Active"
     if hr is not None and hr < 55:
@@ -167,8 +199,9 @@ def generate_report(bin_path: str, output_path: str) -> str:
 
     # ── Per-minute analysis ──
     rows = []
+    noise_count = 0
     has_ppg = len(ppg_ir_arr) > 10
-    has_hr = False  # Will be set if HR extracted
+    has_hr = False
 
     for m in range(n_minutes):
         t_start = t0 + m * 60
@@ -180,15 +213,33 @@ def generate_report(bin_path: str, output_path: str) -> str:
         # EEG band power
         eeg_chunk = eeg_arr[mask]
         bp = compute_band_power_chunk(eeg_chunk, SFREQ) if eeg_chunk.shape[0] > 10 else None
-        if bp and all(bp[b].shape[0] == 4 for b in bp):
-            row["alpha"] = float(np.mean(bp["Alpha"]))
-            row["theta"] = float(np.mean(bp["Theta"]))
-            row["beta"] = float(np.mean(bp["Beta"]))
-            row["delta"] = float(np.mean(bp["Delta"]))
-            row["gamma"] = float(np.mean(bp["Gamma"]))
-            row["theta_beta"] = row["theta"] / row["beta"] if row["beta"] > 0 else 0
+        if bp and all(bp["db"][b].shape[0] == 4 for b in BANDS):
+            # Check noise: reject if ALL channels are noisy
+            all_noisy = np.all(bp["noise"])
+            row["noise"] = all_noisy
+            if all_noisy:
+                noise_count += 1
+
+            # Store dB values (average across channels)
+            row["alpha_db"] = float(np.mean(bp["db"]["Alpha"]))
+            row["theta_db"] = float(np.mean(bp["db"]["Theta"]))
+            row["beta_db"]  = float(np.mean(bp["db"]["Beta"]))
+            row["delta_db"] = float(np.mean(bp["db"]["Delta"]))
+            row["gamma_db"] = float(np.mean(bp["db"]["Gamma"]))
+            row["total_db"] = float(np.mean(bp["total_db"]))
+
+            # Theta/Beta ratio (linear ratio from dB)
+            tb_linear = 10 ** ((row["theta_db"] - row["beta_db"]) / 10.0) if row["beta_db"] > -100 else 0
+            row["theta_beta"] = tb_linear
+
+            # Relative values (for reference)
+            row["alpha_rel"] = float(np.mean(bp["rel"]["Alpha"]))
+            row["beta_rel"]  = float(np.mean(bp["rel"]["Beta"]))
+            row["bg_rel"]    = float(np.mean(bp["rel"]["Beta"] + bp["rel"]["Gamma"]))
         else:
-            row["alpha"] = row["theta"] = row["beta"] = row["delta"] = row["gamma"] = row["theta_beta"] = None
+            row["alpha_db"] = row["theta_db"] = row["beta_db"] = row["delta_db"] = row["gamma_db"] = None
+            row["theta_beta"] = row["total_db"] = row["noise"] = None
+            row["alpha_rel"] = row["beta_rel"] = row["bg_rel"] = None
 
         # HR from PPG
         if has_ppg:
@@ -223,9 +274,13 @@ def generate_report(bin_path: str, output_path: str) -> str:
         else:
             row["gyro_mag"] = None
 
-        # State
-        row["state"] = classify_state(row["alpha"], row["theta"], row["beta"],
-                                       row["theta_beta"], row["hr"])
+        # State (skip noisy epochs)
+        if not row.get("noise"):
+            row["state"] = classify_state(row["alpha_db"], row["theta_db"],
+                                           row["beta_db"], row["delta_db"],
+                                           row["theta_beta"], row["hr"])
+        else:
+            row["state"] = "噪声 Noise"
         rows.append(row)
 
     # ── Build charts ──
@@ -234,15 +289,20 @@ def generate_report(bin_path: str, output_path: str) -> str:
     def n(val):
         return val if val is not None else np.nan
 
-    colors = {"alpha": "#4ecdc4", "beta": "#ff6b6b", "theta": "#ffe66d",
-              "delta": "#888888", "gamma": "#a37eba", "theta_beta": "#ff8c42",
-              "hr": "#ff4444", "acc": "#44aaff", "gyro": "#44ff44"}
+    # Use dB values for charts
+    colors = {"delta": "#888888", "theta": "#ffe66d", "alpha": "#4ecdc4",
+              "beta": "#ff6b6b", "gamma": "#a37eba",
+              "theta_beta": "#ff8c42", "hr": "#ff4444",
+              "acc": "#44aaff", "gyro": "#44ff44"}
 
     state_colors = {"放松 Relaxed": "#4ecdc4", "中性 Neutral": "#888888",
                     "专注 Focused": "#ff6b6b", "冥想 Meditative": "#ffe66d",
-                    "活跃 Active": "#ff8c42", "昏沉 Drowsy": "#a37eba"}
+                    "活跃 Active": "#ff8c42", "昏沉 Drowsy": "#a37eba",
+                    "噪声 Noise": "#ff4444"}
 
-    # ── Chart 1: EEG Band Power ──
+    clean_rows = [r for r in rows if not r.get("noise")]
+
+    # ── Chart 1: EEG Band Power (ABSOLUTE dB) ──
     fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7))
     fig1.patch.set_facecolor("#0f0f11")
     for ax in [ax1, ax2]:
@@ -254,25 +314,32 @@ def generate_report(bin_path: str, output_path: str) -> str:
         ax.spines["right"].set_visible(False)
         ax.grid(True, color="#222", linewidth=0.3)
 
-    vals = {k: [n(r[k]) for r in rows] for k in ["alpha", "beta", "theta", "delta", "gamma"]}
-    for band, label in [("alpha", "α Alpha"), ("beta", "β Beta"),
-                         ("theta", "θ Theta"), ("delta", "δ Delta"),
+    vals = {k: [n(r[k + "_db"]) for r in rows] for k in ["delta", "theta", "alpha", "beta", "gamma"]}
+    for band, label in [("delta", "δ Delta"), ("theta", "θ Theta"),
+                         ("alpha", "α Alpha"), ("beta", "β Beta"),
                          ("gamma", "γ Gamma")]:
         ax1.plot(minutes, vals[band], color=colors[band], linewidth=1.5,
                  marker="o", markersize=4, label=label)
-    ax1.set_ylabel("Relative Power", color="#ccc")
-    ax1.set_title("EEG Band Power Trends", color="#ccc", fontweight="bold")
+    ax1.set_ylabel("Power (dB re 1 μV²)", color="#ccc")
+    ax1.set_title("EEG Absolute Band Power (dB)", color="#ccc", fontweight="bold")
     ax1.legend(loc="upper right", fontsize=7, facecolor="#1a1a2e",
                edgecolor="#333", labelcolor="#ccc")
 
+    # Shade noisy minutes in red
+    for r in rows:
+        if r.get("noise"):
+            ax1.axvspan(r["minute"] - 0.5, r["minute"] + 0.5,
+                        facecolor="#ff0000", alpha=0.08)
+
+    # Theta/Beta ratio (linear)
     tb = [n(r["theta_beta"]) for r in rows]
     ax2.fill_between(minutes, 0, tb, color=colors["theta_beta"], alpha=0.3)
     ax2.plot(minutes, tb, color=colors["theta_beta"], linewidth=2, marker="s", markersize=5)
-    ax2.axhline(y=0.8, color="#666", linewidth=0.8, linestyle="--")
-    ax2.axhline(y=1.5, color="#666", linewidth=0.8, linestyle="--")
+    ax2.axhline(y=1.0, color="#666", linewidth=0.8, linestyle="--")
+    ax2.axhline(y=2.0, color="#666", linewidth=0.8, linestyle="--")
     ax2.set_ylabel("θ/β Ratio", color="#ccc")
     ax2.set_xlabel("Minute", color="#ccc")
-    ax2.set_title("Theta/Beta Ratio (Focus Index)", color="#ccc", fontweight="bold")
+    ax2.set_title("Theta/Beta Ratio", color="#ccc", fontweight="bold")
     ax2.set_ylim(bottom=0)
     chart1 = fig_to_b64(fig1)
     plt.close(fig1)
@@ -331,12 +398,9 @@ def generate_report(bin_path: str, output_path: str) -> str:
     ax3.set_ylim(0, 1); ax3.set_xlim(0, n_minutes)
     ax3.set_yticks([])
     ax3.set_xlabel("Minute", color="#ccc")
-    ax3.set_title("Brain State Timeline", color="#ccc", fontweight="bold")
+    ax3.set_title("Brain State Timeline (red = noise rejected)", color="#ccc", fontweight="bold")
     ax3.tick_params(colors="#888888")
     for s in ax3.spines.values(): s.set_visible(False)
-
-    states_order = ["放松 Relaxed", "中性 Neutral", "专注 Focused",
-                    "冥想 Meditative", "活跃 Active", "昏沉 Drowsy"]
 
     prev_state = None
     for i, r in enumerate(rows):
@@ -352,31 +416,49 @@ def generate_report(bin_path: str, output_path: str) -> str:
         if any(r["state"] == state for r in rows):
             ax3.plot([], [], color=color, linewidth=6, label=state)
     ax3.legend(loc="upper right", fontsize=7, facecolor="#1a1a2e",
-               edgecolor="#333", labelcolor="#ccc", ncol=3)
+               edgecolor="#333", labelcolor="#ccc", ncol=4)
     chart3 = fig_to_b64(fig3)
     plt.close(fig3)
 
-    # ── Summary stats ──
-    avg_alpha = np.nanmean([r["alpha"] for r in rows if r["alpha"] is not None])
-    avg_tb = np.nanmean([r["theta_beta"] for r in rows if r["theta_beta"] is not None])
+    # ── Summary stats (from clean epochs only, fallback to all if none clean) ──
+    src = clean_rows if clean_rows else rows
+    avg_delta = np.nanmean([r["delta_db"] for r in src if r["delta_db"] is not None]) if src else 0
+    avg_alpha = np.nanmean([r["alpha_db"] for r in src if r["alpha_db"] is not None]) if src else 0
+    avg_beta  = np.nanmean([r["beta_db"]  for r in src if r["beta_db"] is not None]) if src else 0
+    avg_theta = np.nanmean([r["theta_db"] for r in src if r["theta_db"] is not None]) if src else 0
+    avg_tb = np.nanmean([r["theta_beta"] for r in src if r["theta_beta"] is not None]) if src else 0
     avg_hr = np.nanmean([r["hr"] for r in rows if r["hr"] is not None])
+    clean_pct = 100 * (n_minutes - noise_count) / max(n_minutes, 1)
 
     # ── Per-minute table ──
     table_rows = ""
     for r in rows:
-        def v(val, fmt=".4f"):
-            return f"{val:{fmt}}" if val is not None else "-"
+        def vd(val):
+            return f"{val:.1f} dB" if val is not None else "-"
+        def vr(val):
+            return f"{val:.3f}" if val is not None else "-"
         hr_str = f"{r['hr']:.0f}" if r["hr"] else "-"
         acc_str = f"{r['acc_mag']:.3f}" if r["acc_mag"] is not None else "-"
         sc = state_colors.get(r["state"], "#888")
+        noise_mark = " ⚠" if r.get("noise") else ""
         table_rows += f"""<tr>
-            <td>{r['minute']}</td>
-            <td>{v(r['alpha'])}</td><td>{v(r['beta'])}</td><td>{v(r['theta'])}</td>
-            <td>{v(r['theta_beta'])}</td><td>{hr_str}</td><td>{acc_str}</td>
+            <td>{r['minute']}{noise_mark}</td>
+            <td>{vd(r['delta_db'])}</td><td>{vd(r['theta_db'])}</td><td>{vd(r['alpha_db'])}</td>
+            <td>{vd(r['beta_db'])}</td><td>{vd(r['gamma_db'])}</td>
+            <td>{vr(r['theta_beta'])}</td><td>{hr_str}</td><td>{acc_str}</td>
             <td style="color:{sc};font-weight:bold;">{r['state']}</td>
         </tr>"""
 
     session_name = Path(bin_path).stem
+
+    # ── Noise summary ──
+    noise_html = ""
+    if noise_count > 0:
+        noise_html = f"""<div class="summary">
+    <div style="border:1px solid #ef5350;"><span class="label">⚠ 噪声分钟</span><br>
+        <span class="value" style="color:#ef5350;">{noise_count}/{n_minutes}</span></div>
+    <div><span class="label">干净数据占比</span><br><span class="value">{clean_pct:.0f}%</span></div>
+</div>"""
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -405,14 +487,17 @@ img {{ max-width:100%; border:1px solid #333; border-radius:4px; }}
 <h1>EEG Recording Report<br>
 <small>{session_name}</small></h1>
 
+{noise_html}
+
 <div class="summary">
     <div><span class="label">Duration</span><br><span class="value">{duration/60:.1f} min</span></div>
-    <div><span class="label">Avg Alpha</span><br><span class="value">{avg_alpha:.3f}</span></div>
-    <div><span class="label">Avg TB-Ratio</span><br><span class="value">{avg_tb:.3f}</span></div>
+    <div><span class="label">Avg Delta</span><br><span class="value">{avg_delta:.1f} dB</span></div>
+    <div><span class="label">Avg Alpha</span><br><span class="value">{avg_alpha:.1f} dB</span></div>
+    <div><span class="label">Avg Theta/Beta</span><br><span class="value">{avg_tb:.2f}</span></div>
     <div><span class="label">Avg HR</span><br><span class="value">{avg_hr:.0f} BPM</span></div>
 </div>
 
-<h2>1. EEG Band Power Trends</h2>
+<h2>1. EEG Absolute Band Power (dB re 1 μV²)</h2>
 <img src="data:image/png;base64,{chart1}">
 
 <h2>2. Heart Rate &amp; Motion</h2>
@@ -423,13 +508,15 @@ img {{ max-width:100%; border:1px solid #333; border-radius:4px; }}
 
 <h2>4. Per-Minute Data</h2>
 <table>
-<tr><th>Min</th><th>Alpha</th><th>Beta</th><th>Theta</th><th>TB-Ratio</th><th>HR</th><th>ACC</th><th>State</th></tr>
+<tr><th>Min</th><th>Delta</th><th>Theta</th><th>Alpha</th><th>Beta</th><th>Gamma</th><th>TB-Ratio</th><th>HR</th><th>ACC</th><th>State</th></tr>
 {table_rows}
 </table>
 
 <p class="note">
     Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}<br>
-    Bands: Delta 0.5-4Hz | Theta 4-8Hz | Alpha 8-12Hz | Beta 12-30Hz | Gamma 30-45Hz
+    Y-axis: dB = 10×log₁₀(μV²) — absolute power referenced to 1 μV²<br>
+    Bands: Delta 0.5-4Hz | Theta 4-8Hz | Alpha 8-12Hz | Beta 12-30Hz | Gamma 30-45Hz<br>
+    Noise rejection: epochs where Beta+Gamma &gt; {NOISE_BG_RATIO*100:.0f}% of total power are marked ⚠ and excluded from averages
 </p>
 </body></html>"""
 
