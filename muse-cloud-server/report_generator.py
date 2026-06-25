@@ -149,24 +149,24 @@ def generate_report(bin_path: str, output_path: str) -> str:
     stream = MuseRawStream(bin_path)
     stream.open_read()
 
-    timestamps, eeg_raw, ppg_raw, acc_raw, gyro_raw, hr_raw = [], [], [], [], [], []
-    ppg_ir = []  # IR channel for HR
+    timestamps, eeg_raw = [], []
+    pkt_timestamps, ppg_ir, acc_raw, gyro_raw = [], [], [], []
 
     for pkt in stream.read_packets():
         decoded = stream.decode_packet(pkt)
         ts = pkt.timestamp.timestamp()
+        pkt_timestamps.append(ts)
 
-        # EEG
+        # EEG — unpack all 4 samples per packet (restoring true 256 Hz rate)
         if "eeg" in decoded:
-            timestamps.append(ts)
-            row = [0.0] * 4
-            for i, ch in enumerate(CHANNELS):
-                if ch in decoded["eeg"]:
-                    row[i] = decoded["eeg"][ch][-1]  # Last sample
-            eeg_raw.append(row)
-        else:
-            timestamps.append(ts)
-            eeg_raw.append([0.0] * 4)
+            for s in range(4):
+                t_sample = ts - (3 - s) / SFREQ
+                timestamps.append(t_sample)
+                row = [0.0] * 4
+                for i, ch in enumerate(CHANNELS):
+                    if ch in decoded["eeg"]:
+                        row[i] = decoded["eeg"][ch][s]
+                eeg_raw.append(row)
 
         # PPG — use first available IR channel
         if "ppg" in decoded:
@@ -204,11 +204,15 @@ def generate_report(bin_path: str, output_path: str) -> str:
     if not timestamps:
         return None
 
+    # ── Build arrays ──
     timestamps = np.array(timestamps)
     eeg_arr = np.array(eeg_raw) if eeg_raw else np.zeros((len(timestamps), 4))
+
+    pkt_timestamps = np.array(pkt_timestamps)
+    pkt_count = len(pkt_timestamps)
     ppg_ir_arr = np.array(ppg_ir) if ppg_ir else np.array([])
-    acc_arr = np.array(acc_raw) if acc_raw else np.zeros((len(timestamps), 3))
-    gyro_arr = np.array(gyro_raw) if gyro_raw else np.zeros((len(timestamps), 3))
+    acc_arr = np.array(acc_raw) if acc_raw else np.zeros((pkt_count, 3))
+    gyro_arr = np.array(gyro_raw) if gyro_raw else np.zeros((pkt_count, 3))
 
     t0 = timestamps[0]
     tend = timestamps[-1]
@@ -227,6 +231,7 @@ def generate_report(bin_path: str, output_path: str) -> str:
         t_start = t0 + ep * epoch_step
         t_end = t_start + epoch_width
         mask = (timestamps >= t_start) & (timestamps < t_end)
+        pkt_mask = (pkt_timestamps >= t_start) & (pkt_timestamps < t_end)
 
         row = {"minute": round((t_start - t0) / 60, 1)}
 
@@ -261,9 +266,9 @@ def generate_report(bin_path: str, output_path: str) -> str:
             row["theta_beta"] = row["total_db"] = row["noise"] = None
             row["alpha_rel"] = row["beta_rel"] = row["bg_rel"] = None
 
-        # HR from PPG
+        # HR from PPG (uses pkt_timestamps mask)
         if has_ppg:
-            ppg_chunk = ppg_ir_arr[mask]
+            ppg_chunk = ppg_ir_arr[pkt_mask]
             hr_val = compute_hr_chunk(ppg_chunk) if len(ppg_chunk) > 10 else None
             row["hr"] = hr_val
             if hr_val:
@@ -271,9 +276,9 @@ def generate_report(bin_path: str, output_path: str) -> str:
         else:
             row["hr"] = None
 
-        # Movement
+        # Movement (uses pkt_timestamps mask)
         if acc_arr.shape[0] > 0:
-            acc_chunk = acc_arr[mask]
+            acc_chunk = acc_arr[pkt_mask]
             if acc_chunk.shape[0] > 0:
                 mag = np.sqrt(np.sum(acc_chunk ** 2, axis=1))
                 row["acc_mag"] = float(np.mean(mag))
@@ -283,9 +288,9 @@ def generate_report(bin_path: str, output_path: str) -> str:
         else:
             row["acc_mag"] = row["acc_max"] = None
 
-        # Rotation
+        # Rotation (uses pkt_timestamps mask)
         if gyro_arr.shape[0] > 0:
-            gyro_chunk = gyro_arr[mask]
+            gyro_chunk = gyro_arr[pkt_mask]
             if gyro_chunk.shape[0] > 0:
                 mag = np.sqrt(np.sum(gyro_chunk ** 2, axis=1))
                 row["gyro_mag"] = float(np.mean(mag))
