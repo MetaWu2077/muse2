@@ -122,7 +122,10 @@ class UdpReceiver:
         self.callbacks = {}  # path → callback
         self.packet_count = 0
         self.byte_count = 0
+        self.raw_count = 0  # Total UDP datagrams received (including malformed)
+        self.last_error = None
         self.start_time = None
+        self.last_addr = None
 
     def on(self, path, callback):
         self.callbacks[path] = callback
@@ -147,17 +150,23 @@ class UdpReceiver:
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(65536)
-                self.packet_count += 1
+                self.raw_count += 1
+                self.last_addr = addr
                 self.byte_count += len(data)
                 result = decode_osc(data)
                 if result:
                     path, values = result
                     if path in self.callbacks:
                         self.callbacks[path](values, addr)
+                        self.packet_count += 1
+                else:
+                    # Malformed packet — still count it for diagnostics
+                    pass
             except socket.timeout:
                 continue
-            except Exception:
+            except Exception as e:
                 if self.running:
+                    self.last_error = str(e)
                     continue
 
 
@@ -517,6 +526,10 @@ class MuseLocalServer(tk.Tk):
         tk.Label(header, textvariable=self.pkt_var, fg="#546e7a",
                  bg="#1a2d3d", font=("", 9)).pack(side=tk.LEFT, padx=(20, 0))
 
+        self.raw_var = tk.StringVar(value="Raw: 0")
+        tk.Label(header, textvariable=self.raw_var, fg="#546e7a",
+                 bg="#1a2d3d", font=("", 9)).pack(side=tk.LEFT, padx=(10, 0))
+
         self.dur_var = tk.StringVar(value="00:00")
         tk.Label(header, textvariable=self.dur_var, fg="#546e7a",
                  bg="#1a2d3d", font=("", 9)).pack(side=tk.LEFT, padx=(10, 0))
@@ -529,6 +542,11 @@ class MuseLocalServer(tk.Tk):
                                     bg="#2d5f8a", fg="#fff", font=("", 10),
                                     relief=tk.FLAT, padx=14, pady=3, cursor="hand2")
         self.btn_start.pack(side=tk.LEFT, padx=4)
+
+        self.btn_test = tk.Button(btn_frame, text="🔍 Self Test", command=self._self_test,
+                                   bg="#37474f", fg="#ccc", font=("", 10),
+                                   relief=tk.FLAT, padx=14, pady=3, cursor="hand2")
+        self.btn_test.pack(side=tk.LEFT, padx=4)
 
         self.btn_save = tk.Button(btn_frame, text="💾 Save & Report", command=self._save_and_report,
                                    bg="#37474f", fg="#ccc", font=("", 10),
@@ -705,7 +723,35 @@ class MuseLocalServer(tk.Tk):
     def _on_ppg(self, values, addr):
         self.buffer.add_ppg(values)
 
-    def _save_and_report(self):
+    def _self_test(self):
+        """Send a test OSC packet to localhost and verify reception."""
+        if not self.running:
+            from tkinter import messagebox
+            messagebox.showinfo("Self Test", "Press Start first, then Self Test.")
+            return
+
+        before = self.receiver.raw_count
+        try:
+            import struct
+            def ws(s):
+                b = s.encode('utf-8') + b'\x00'
+                return b + b'\x00' * ((4 - len(b) % 4) % 4)
+            path = ws('/muse/eeg')
+            types = ws(',ffffffffffffffffffff')
+            vals = b''.join(struct.pack('>f', float(i)) for i in range(20))
+            packet = path + types + vals
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(packet, ('127.0.0.1', 5000))
+            s.close()
+            time.sleep(0.5)
+            after = self.receiver.raw_count
+
+            if after > before:
+                self.bottom_label.config(text="✅ Self test PASSED — UDP receiver works, packets arrive")
+            else:
+                self.bottom_label.config(text="❌ Self test FAILED — check Windows Firewall for UDP port 5000")
+        except Exception as e:
+            self.bottom_label.config(text=f"❌ Self test error: {e}")
         filepath = self.buffer.save_bin()
         if not filepath:
             from tkinter import messagebox
@@ -787,7 +833,13 @@ class MuseLocalServer(tk.Tk):
             self.dur_var.set(f"{int(dur//60):02d}:{int(dur%60):02d}")
             if self.receiver:
                 pkt = self.receiver.packet_count
-                self.pkt_var.set(f"Packets: {pkt}")
+                raw = self.receiver.raw_count
+                self.pkt_var.set(f"OSC: {pkt}")
+                self.raw_var.set(f"Raw: {raw}")
+                # Show warning if raw packets arrive but OSC decode fails
+                if raw > 0 and pkt == 0:
+                    self.status_var.set("⚠ Bad format")
+                    self.status_label.config(fg="#ff9800")
                 # Auto-start timer on first packet
                 if pkt > 0 and self.buffer.duration_seconds() < 0.5:
                     pass  # timer already running from first sample
