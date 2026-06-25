@@ -97,12 +97,19 @@ class MuseAnalyzer(tk.Tk):
         self.folder_path = tk.StringVar()
         self.status_text = tk.StringVar(value="Ready. Select a folder to begin.")
 
+        # Default directory: report/ in the project root, or from command line
+        DEFAULT_DIR = os.path.join(SCRIPT_DIR, "report")
+        os.makedirs(DEFAULT_DIR, exist_ok=True)
+
         self._build_ui()
 
-        # Accept folder as command-line argument
+        # Open folder: command-line arg > default directory
         if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
             self.folder_path.set(sys.argv[1])
             self._load_folder(sys.argv[1])
+        elif os.path.isdir(DEFAULT_DIR):
+            self.folder_path.set(DEFAULT_DIR)
+            self._load_folder(DEFAULT_DIR)
 
     # ── UI ──────────────────────────────────────────────────────────────
 
@@ -245,7 +252,7 @@ class MuseAnalyzer(tk.Tk):
 
         if not self.files:
             self.file_count_label.config(text="没有找到 .bin 文件")
-            self.status_text.set(f"No .bin files in: {path}")
+            self.status_text.set(f"将 .bin 文件放入此目录即可: {path}")
             return
 
         self.file_count_label.config(text=f"{len(self.files)} 个会话文件")
