@@ -13,8 +13,10 @@ import com.musebridge.gatt.ConnectionState
 import com.musebridge.gatt.MuseGattManager
 import com.musebridge.gatt.MuseGatt
 import com.musebridge.osc.OscSender
+import com.musebridge.osc.RawUdpSender
 import com.musebridge.cloud.CloudWebSocketManager
 import com.musebridge.parser.DataDecoder
+import com.musebridge.parser.MuseStatusParser
 import com.musebridge.scanner.BleDevice
 import com.musebridge.scanner.BleScanner
 import com.musebridge.storage.OfflineStorageManager
@@ -56,6 +58,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val scanner = BleScanner(museApp)
     val gattManager = MuseGattManager(app, log = { appendLog(it) })
     val oscSender = OscSender(viewModelScope)
+    val rawUdpSender = RawUdpSender(viewModelScope)
     val cloudWs = CloudWebSocketManager(viewModelScope)
     private val storage = OfflineStorageManager(app)
 
@@ -75,7 +78,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var releaseWakelocksJob: kotlinx.coroutines.Job? = null
     private var sessionHadCloudIssues = false
 
+    // Local mode
+    private var localHost = "192.168.2.5"
+    private var localPort = 5000
+    private var localModeEnabled = false
+    private var statusPollJob: Job? = null
+
     init {
+        gattManager.onBatteryUpdate = { bp ->
+            updateBattery(bp)
+        }
+
         // Observe scanner devices
         viewModelScope.launch {
             scanner.devices.collect { devices ->
@@ -111,12 +124,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
                 // Manage wake locks based on connection state
                 when (state) {
-                    ConnectionState.STREAMING, ConnectionState.SUBSCRIBING,
-                    ConnectionState.CONNECTING, ConnectionState.CONNECTED -> {
+                    ConnectionState.STREAMING -> {
+                        acquireWakeLocks()
+                        releaseWakelocksJob?.cancel(); releaseWakelocksJob = null
+                        startStatusPoll()
+                        gattManager.requestStatus()
+                        appendLog("Status poll started")
+                    }
+                    ConnectionState.CONNECTED -> {
+                        acquireWakeLocks()
+                        releaseWakelocksJob?.cancel(); releaseWakelocksJob = null
+                        gattManager.requestStatus()
+                    }
+                    ConnectionState.SUBSCRIBING,
+                    ConnectionState.CONNECTING -> {
                         acquireWakeLocks()
                         releaseWakelocksJob?.cancel(); releaseWakelocksJob = null
                     }
                     ConnectionState.DISCONNECTED -> {
+                        stopStatusPoll()
                         if (_uiState.value.isMeditating) {
                             // Keep CPU/network alive during meditation reconnect
                             acquireWakeLocks()
@@ -147,22 +173,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Cloud WebSocket callbacks
         cloudWs.onConnected = {
             _uiState.update { it.copy(cloudConnected = true) }
-            appendLog("Cloud: connected")
-            // Try uploading background data if not meditating
-            checkAndUploadOfflineData()
+            appendLog("Cloud: connected (idle — press GO to start session)")
+            if (_uiState.value.isMeditating && !localModeEnabled) {
+                cloudWs.startMeditationSession()
+            }
         }
         cloudWs.onDisconnected = { reason ->
             _uiState.update { it.copy(cloudConnected = false, cloudSessionId = "") }
             appendLog("Cloud: disconnected ($reason)")
-            sessionHadCloudIssues = true
-
             if (_uiState.value.isMeditating) {
+                sessionHadCloudIssues = true
                 appendLog("Cloud lost during Zen — local backup continues")
             }
         }
         cloudWs.onSessionReady = { sid ->
-            _uiState.update { it.copy(cloudSessionId = sid) }
-            appendLog("Cloud: session $sid")
+            if (_uiState.value.isMeditating || uploadJob?.isActive == true) {
+                _uiState.update { it.copy(cloudSessionId = sid) }
+                appendLog("Cloud: session $sid")
+            }
         }
         cloudWs.onCommand = { cmd ->
             appendLog("Cloud: cmd=$cmd")
@@ -171,9 +199,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        // AUTO-CHECK: Connect to cloud server immediately to check online status
+        // Cloud reachability only when not in local mode
         val url = _uiState.value.cloudUrl
-        if (url.isNotBlank()) {
+        if (url.isNotBlank() && !localModeEnabled) {
             cloudWs.connect(url, "Zen-User", "p1034")
         }
     }
@@ -204,6 +232,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun disconnect() {
         gattManager.disconnect()
+        rawUdpSender.stop()
         oscSender.stop()
         cloudWs.disconnect()
         releaseWakeLocks()
@@ -268,39 +297,73 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // Local mode target (configurable IP:port)
-    private var localHost = "192.168.2.5"
-    private var localPort = 5000
-
     fun getLocalTarget(): String = "$localHost:$localPort"
 
     fun updateLocalTarget(host: String, port: Int) {
         localHost = host
         localPort = port
-        oscSender.configure(host, port)
-        if (oscSender.isRunning) {
-            oscSender.stop()
-            oscSender.start()
+        try {
+            rawUdpSender.configure(host, port)
+            oscSender.configure(host, port)
+            val ctx = getApplication<Application>()
+            if (rawUdpSender.isRunning) {
+                rawUdpSender.stop()
+                rawUdpSender.start(ctx)
+            }
+            if (oscSender.isRunning) {
+                oscSender.stop()
+                oscSender.start(ctx)
+            }
+            appendLog("Local target: $host:$port (raw + OSC)")
+        } catch (e: Exception) {
+            appendLog("Local target error: ${e.message}")
+            Log.e("MainViewModel", "Invalid local target $host:$port", e)
         }
-        appendLog("Local target: $host:$port")
     }
 
-    fun updateOscTarget(host: String, port: Int) {
-        oscSender.configure(host, port)
-    }
-
-    /**
-     * Toggle local mode: when enabled, start OSC sender targeting the desktop.
-     * When disabled, stop OSC sender (cloud WebSocket handles transmission).
-     */
     fun setLocalMode(enabled: Boolean) {
+        localModeEnabled = enabled
         if (enabled) {
-            updateOscTarget(localHost, localPort)
-            oscSender.start()
-            appendLog("Local Mode: OSC → $localHost:$localPort")
+            rawUdpSender.configure(localHost, localPort)
+            oscSender.configure(localHost, localPort)
+            cloudWs.disconnect()
+            _uiState.update { it.copy(cloudConnected = false, cloudSessionId = "") }
+            appendLog("Local Mode armed → $localHost:$localPort (press GO)")
         } else {
+            rawUdpSender.stop()
             oscSender.stop()
-            appendLog("Local Mode: disabled")
+            appendLog("Local Mode OFF")
+            val url = _uiState.value.cloudUrl
+            if (url.isNotBlank() && !cloudWs.isConnected) {
+                cloudWs.connect(url, "Zen-User", "p1034")
+            }
         }
+    }
+
+    private fun startLocalStreaming() {
+        if (!localModeEnabled) return
+        if (localHost.isBlank()) {
+            appendLog("Local target IP is empty")
+            return
+        }
+        try {
+            rawUdpSender.configure(localHost, localPort)
+            oscSender.configure(localHost, localPort)
+        } catch (e: Exception) {
+            appendLog("Local target invalid: ${e.message}")
+            return
+        }
+        val ctx = getApplication<Application>()
+        rawUdpSender.start(ctx)
+        oscSender.start(ctx)
+        appendLog("Local stream → $localHost:$localPort (raw BLE + OSC)")
+    }
+
+    private fun stopLocalStreaming() {
+        if (!localModeEnabled) return
+        rawUdpSender.stop()
+        oscSender.stop()
+        appendLog("Local stream stopped")
     }
 
     fun setMeditation(active: Boolean) {
@@ -312,19 +375,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             acquireWakeLocks()
             startTimer()
             storage.startSession()
+            startLocalStreaming()
 
-            if (_uiState.value.cloudConnected) {
-                cloudWs.startMeditationSession()
-                appendLog("Cloud: requesting new session...")
-            } else {
-                appendLog("Server is offline. Saving locally...")
+            if (!localModeEnabled) {
+                if (_uiState.value.cloudConnected) {
+                    cloudWs.startMeditationSession()
+                    appendLog("Cloud: requesting new session...")
+                } else {
+                    sessionHadCloudIssues = true
+                    appendLog("Server is offline. Saving locally...")
+                }
             }
         } else {
             stopTimer()
             storage.endSession()
+            stopLocalStreaming()
             appendLog("Zen session ended")
 
-            if (_uiState.value.cloudConnected) {
+            if (!localModeEnabled && _uiState.value.cloudConnected) {
                 cloudWs.endMeditationSession()
                 _uiState.update { it.copy(cloudSessionId = "") }
                 appendLog("Cloud: session ended")
@@ -436,60 +504,99 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val data = packet.data
         packetCounter++
 
-        if (suffix == "0013") {
-            // Athena multiplexed sensor data — parse TAG-based subpackets
-            val subpackets = DataDecoder.parsePayload(data)
+        when (suffix) {
+            // Control 0001 battery: handled in MuseGattManager → onBatteryUpdate
+            "0013" -> {
+                MuseStatusParser.parseBatteryFromSensorPayload(data)?.let { updateBattery(it) }
 
-            if (loggedSuffixes.add(suffix)) {
-                appendLog("SENSOR: ${data.size}B, ${subpackets.size} subpkts")
-            }
+                val subpackets = DataDecoder.parsePayload(data)
+                if (loggedSuffixes.add(suffix)) {
+                    appendLog("SENSOR: ${data.size}B, ${subpackets.size} subpkts")
+                }
 
-            // ── Data Export: always local backup during meditation + cloud when available ──
-            if (uiState.value.isMeditating) {
-                storage.savePacket(data)
-                if (uiState.value.cloudConnected && cloudWs.sessionId.isNotEmpty()) {
-                    if (!cloudWs.sendPacket(data)) {
+                val streamingLocal = localModeEnabled && _uiState.value.isMeditating
+                for (sp in subpackets) {
+                    if (sp.hasEeg && sp.eeg != null) {
+                        val ch = sp.eegChannels
+                        val ns = sp.eegSamples
+                        if (streamingLocal && oscSender.isRunning) {
+                            val batch = FloatArray(ns * 5)
+                            for (s in 0 until ns) {
+                                for (c in 0 until minOf(ch, 5)) {
+                                    batch[s * 5 + c] = sp.eeg[s * ch + c]
+                                }
+                            }
+                            oscSender.sendFloats("/muse/eeg", batch)
+                        }
+                        for (c in 0 until minOf(ch, 4)) {
+                            accumulateEeg(c, floatArrayOf(sp.eeg[(ns - 1) * ch + c]))
+                        }
+                        updateSignalQuality()
+                    }
+                    if (streamingLocal && sp.hasAccGyro) {
+                        sp.accel?.let { oscSender.sendFloats("/muse/acc", it) }
+                        sp.gyro?.let { oscSender.sendFloats("/muse/gyro", it) }
+                    }
+                    if (streamingLocal && sp.hasPpg && sp.ppg != null) {
+                        oscSender.sendFloats("/muse/ppg", sp.ppg)
+                    }
+                }
+
+                if (!_uiState.value.isMeditating) return
+
+                if (localModeEnabled) {
+                    if (!rawUdpSender.isRunning) {
+                        appendLog("WARN: raw sender not running — press GO again")
+                        return
+                    }
+                    rawUdpSender.send(data)
+                } else {
+                    storage.savePacket(data)
+                    if (uiState.value.cloudConnected && cloudWs.sessionId.isNotEmpty()) {
+                        if (!cloudWs.sendPacket(data)) {
+                            sessionHadCloudIssues = true
+                        }
+                    } else {
                         sessionHadCloudIssues = true
                     }
-                } else {
-                    sessionHadCloudIssues = true
-                }
-            }
-
-            for (sp in subpackets) {
-                if (sp.hasEeg && sp.eeg != null) {
-                    // EEG: (nSamples × nChannels) flat, row-major
-                    // Batch all samples into one OSC message: ns*ch floats
-                    val ch = sp.eegChannels
-                    val ns = sp.eegSamples
-                    val batch = FloatArray(ns * 5)
-                    for (s in 0 until ns) {
-                        for (c in 0 until minOf(ch, 5)) {
-                            batch[s * 5 + c] = sp.eeg[s * ch + c]
-                        }
-                    }
-                    oscSender.sendFloats("/muse/eeg", batch)
-
-                    // Update signal quality from last sample in batch
-                    for (c in 0 until minOf(ch, 4)) {
-                        accumulateEeg(c, floatArrayOf(batch[(ns-1) * 5 + c]))
-                    }
-                    updateSignalQuality()
-                }
-                if (sp.hasAccGyro) {
-                    sp.accel?.let { oscSender.sendFloats("/muse/acc", it) }
-                    sp.gyro?.let { oscSender.sendFloats("/muse/gyro", it) }
-                }
-                if (sp.hasPpg && sp.ppg != null) {
-                    // Send all PPG samples in one batch: ns*ch floats
-                    oscSender.sendFloats("/muse/ppg", sp.ppg)
                 }
             }
         }
 
         if (packetCounter % 50 == 0) {
-            appendLog("pkts: $packetCounter, cloud: ${cloudWs.packetCount} pkt, ${cloudWs.dropCount} drop")
+            val info = when {
+                localModeEnabled && _uiState.value.isMeditating ->
+                    "raw:${rawUdpSender.packetCount} osc:${oscSender.packetCount} → $localHost:$localPort"
+                localModeEnabled ->
+                    "armed (press GO) → $localHost:$localPort"
+                _uiState.value.isMeditating ->
+                    "cloud: ${cloudWs.packetCount} pkt"
+                else ->
+                    "idle (press GO to stream)"
+            }
+            appendLog("pkts: $packetCounter, $info")
         }
+    }
+
+    private fun updateBattery(bp: Float) {
+        if (!bp.isNaN() && bp in 0f..100f) {
+            _uiState.update { it.copy(batteryPercent = bp) }
+        }
+    }
+
+    private fun startStatusPoll() {
+        statusPollJob?.cancel()
+        statusPollJob = viewModelScope.launch {
+            while (isActive) {
+                delay(15_000L)
+                gattManager.requestStatus()
+            }
+        }
+    }
+
+    private fun stopStatusPoll() {
+        statusPollJob?.cancel()
+        statusPollJob = null
     }
 
     private fun accumulateEeg(channel: Int, samples: FloatArray) {
@@ -554,6 +661,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         super.onCleared()
         releaseWakeLocks()
         gattManager.disconnect()
+        rawUdpSender.stop()
         oscSender.stop()
         cloudWs.disconnect()
         scanner.stopScan()

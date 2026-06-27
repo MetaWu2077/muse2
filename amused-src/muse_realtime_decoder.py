@@ -19,6 +19,7 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 import muse_athena_protocol as proto
+import muse_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -173,56 +174,48 @@ class MuseRealtimeDecoder:
                     decoded.ppg[ch_name] = arr[:, ch_idx].tolist()
                 self.stats['ppg_samples'] += arr.shape[0]
 
-                # Update heart rate buffer using IR channel (index 0)
-                ir_samples = arr[:, 0].tolist()
-                self.ppg_buffer.extend(ir_samples)
-                if len(self.ppg_buffer) > 128:  # 2 seconds at 64Hz
+                # LO_NIR (ch0 in 8ch layout) for HR — shared with muse_metrics
+                hr_ch = 0
+                if n_channels == 8:
+                    try:
+                        hr_ch = names.index(muse_metrics.PPG_HR_CHANNEL)
+                    except ValueError:
+                        hr_ch = 0
+                hr_samples = arr[:, hr_ch].tolist()
+                self.ppg_buffer.extend(hr_samples)
+                max_buf = int(muse_metrics.PPG_SFREQ * 30)
+                if len(self.ppg_buffer) > max_buf:
+                    self.ppg_buffer = self.ppg_buffer[-max_buf:]
+                if len(self.ppg_buffer) >= int(muse_metrics.PPG_SFREQ * 3):
                     self._calculate_heart_rate(decoded)
-                    if len(self.ppg_buffer) > 320:  # Keep max 5 seconds
-                        self.ppg_buffer = self.ppg_buffer[-320:]
 
             if decoded.packet_type == 'SENSOR':
                 decoded.packet_type = 'OPTICS'
 
         # Battery
         if parsed["BATTERY"]:
-            decoded.packet_type = 'BATTERY'
+            for subpacket in parsed["BATTERY"]:
+                bat = subpacket.get("data") or {}
+                bp = bat.get("bp")
+                if bp is not None:
+                    decoded.battery = int(round(float(bp)))
+            if decoded.packet_type != 'MULTI':
+                decoded.packet_type = 'BATTERY'
 
         # Combined packet type
         if parsed["EEG"] and (parsed["OPTICS"] or parsed["ACCGYRO"]):
             decoded.packet_type = 'MULTI'
 
     def _calculate_heart_rate(self, decoded: DecodedData):
-        """Calculate heart rate from PPG buffer (bandpass filter + peak detection)."""
-        if len(self.ppg_buffer) < 128:  # Need at least 2 seconds
+        """Calculate heart rate from LO_NIR PPG buffer (shared muse_metrics)."""
+        if len(self.ppg_buffer) < int(muse_metrics.PPG_SFREQ * 3):
             return
-
         try:
-            signal = np.array(
-                self.ppg_buffer[-640:] if len(self.ppg_buffer) > 640
-                else self.ppg_buffer
-            )
-
-            # Detrend and bandpass filter (0.7-4 Hz, matching report_generator)
-            signal = signal - np.mean(signal)
-            sfreq = 64.0
-            nyq = sfreq / 2
-            b, a = butter(2, [0.7 / nyq, 4.0 / nyq], btype='band')
-            filtered = filtfilt(b, a, signal)
-
-            if not SCIPY_AVAILABLE:
-                return
-            peaks, _ = find_peaks(filtered, distance=int(sfreq * 0.35),
-                                  height=0.1 * np.std(filtered))
-
-            if len(peaks) > 1:
-                peak_intervals = np.diff(peaks) / sfreq  # 64 Hz
-                heart_rate = 60.0 / np.median(peak_intervals)
-
-                if 40 < heart_rate < 200:  # Physiological range
-                    decoded.heart_rate = heart_rate
-                    self.last_heart_rate = heart_rate
-                    logger.debug("Calculated HR: %.1f BPM", heart_rate)
+            result = muse_metrics.analyze_ppg(np.array(self.ppg_buffer))
+            if result and result["hr"]:
+                decoded.heart_rate = result["hr"]
+                self.last_heart_rate = result["hr"]
+                logger.debug("Calculated HR: %.1f BPM", result["hr"])
         except Exception:
             pass
 

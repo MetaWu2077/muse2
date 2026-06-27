@@ -96,17 +96,12 @@ def compute_band_power_chunk(data, sfreq):
 
 
 def compute_hr_chunk(ppg, sfreq=64.0):
-    if len(ppg) < int(sfreq * 2):
-        return None
-    ppg_c = ppg - np.mean(ppg)
-    nyq = sfreq / 2
-    b, a = butter(2, [0.7 / nyq, 4.0 / nyq], btype="band")
-    filtered = filtfilt(b, a, ppg_c)
-    peaks, _ = find_peaks(filtered, distance=int(sfreq * 0.35),
-                          height=0.1 * np.std(filtered))
-    if len(peaks) >= 2:
-        return 60.0 / np.median(np.diff(peaks) / sfreq)
-    return None
+    import sys as _sys
+    _amusedsrc = os.path.join(os.path.dirname(__file__), "..", "amused-src")
+    if _amusedsrc not in _sys.path:
+        _sys.path.insert(0, _amusedsrc)
+    from muse_metrics import compute_hr_chunk as _shared_hr
+    return _shared_hr(ppg, sfreq)
 
 
 def classify_state(alpha, theta, beta, delta, theta_beta_ratio, hr):

@@ -286,5 +286,25 @@ class TestSensorConfig(unittest.TestCase):
         self.assertEqual(proto.SENSOR_CONFIG[proto.TAG_ACCGYRO][3], 36)
 
 
+class TestBatteryDecode(unittest.TestCase):
+    """Battery decoding per OpenMuse / muse-rs (u16 LE ÷ 256)."""
+
+    def test_binary_85_percent(self):
+        raw = (85 * 256).to_bytes(2, "little") + b"\x00" * 18
+        result = proto.decode_battery(raw, proto.TAG_BATTERY_2)
+        self.assertAlmostEqual(result["bp"], 85.0, places=1)
+
+    def test_binary_0x88_large_payload(self):
+        raw = (72 * 256).to_bytes(2, "little") + b"\x00" * 200
+        result = proto.decode_battery(raw, proto.TAG_BATTERY_1)
+        self.assertAlmostEqual(result["bp"], 72.0, places=1)
+
+    def test_status_json_bp(self):
+        payload = b'\x7b"bp":91.5,"fw":"4.0.0"\x7d'
+        info = proto.decode_status_json(payload)
+        self.assertIsNotNone(info)
+        self.assertAlmostEqual(info["bp"], 91.5, places=1)
+
+
 if __name__ == '__main__':
     unittest.main()

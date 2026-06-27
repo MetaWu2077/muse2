@@ -248,17 +248,33 @@ def decode_optics(data: bytes, n_channels: int) -> np.ndarray:
 
 
 def decode_battery(data: bytes, tag: int) -> dict:
-    """Decode battery information.
+    """Decode battery SOC from BATTERY subpackets (0x88 / 0x98).
 
-    Args:
-        data: Raw data bytes.
-        tag: TAG_BATTERY_1 (0x88) or TAG_BATTERY_2 (0x98).
-
-    Returns:
-        Dict with battery info. Exact structure depends on firmware.
+    OpenMuse / muse-rs: first 2 payload bytes = u16 LE ÷ 256 → percent.
+    Control-channel status JSON (``bp``) uses the same scale; see ``decode_status_json``.
     """
-    # Battery packets contain JSON-like status; for now return raw
-    return {"raw": data, "tag": tag}
+    import struct
+
+    result = {"raw": data, "tag": tag, "bp": None}
+    if len(data) >= 2:
+        raw_soc = struct.unpack("<H", data[0:2])[0]
+        result["bp"] = raw_soc / 256.0
+    return result
+
+
+def decode_status_json(data: bytes) -> Optional[dict]:
+    """Parse control-channel (273e0001) status JSON, including ``bp`` battery field."""
+    import json
+
+    try:
+        text = data.decode("utf-8", errors="ignore")
+        if "{" not in text or "}" not in text:
+            return None
+        start = text.index("{")
+        end = text.rindex("}") + 1
+        return json.loads(text[start:end])
+    except Exception:
+        return None
 
 
 def decode_subpacket(tag: int, data: bytes) -> Optional[dict]:

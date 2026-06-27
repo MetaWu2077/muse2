@@ -5,6 +5,7 @@ import android.bluetooth.*
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import com.musebridge.parser.MuseStatusParser
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -68,6 +69,8 @@ class MuseGattManager(
     private val _dataFlow = MutableSharedFlow<MusePacket>(replay = 0, extraBufferCapacity = 128)
     val dataFlow: SharedFlow<MusePacket> = _dataFlow
 
+    var onBatteryUpdate: ((Float) -> Unit)? = null
+
     /* Encode command per Athena protocol: [len+1][text][\\n] */
     private fun encodeCmd(text: String): ByteArray {
         val raw = text.toByteArray(Charsets.UTF_8) + byteArrayOf('\n'.code.toByte())
@@ -77,6 +80,7 @@ class MuseGattManager(
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
         l("Connecting to ${device.address}...")
+        MuseStatusParser.resetControlAccumulator()
         lastDevice = device
         reconnectCount = 0
         isIntentionalDisconnect = false
@@ -163,14 +167,27 @@ class MuseGattManager(
         }
 
         private fun handleNotification(uuid: UUID, value: ByteArray) {
-            val s = uuid.toString().lowercase()
-            val suffix = if (s.length >= 8) s.substring(4, 8) else "????"
+            val suffix = museUuidSuffix(uuid)
             scope.launch {
                 if (suffix == "0001") {
-                    val text = String(value, Charsets.UTF_8).trim()
-                    if (text.isNotEmpty()) l("Ctrl: $text")
+                    val fragment = MuseStatusParser.decodeControlFragment(value)
+                    if (fragment.isNotEmpty()) l("Ctrl: $fragment")
+                    MuseStatusParser.feedControlNotification(value)?.let { bp ->
+                        l("Battery: ${bp.toInt()}%")
+                        onBatteryUpdate?.invoke(bp)
+                    }
                 }
                 _dataFlow.emit(MusePacket(suffix, value))
+            }
+        }
+
+        private fun museUuidSuffix(uuid: UUID): String {
+            val s = uuid.toString().lowercase()
+            return when {
+                "273e0013" in s -> "0013"
+                "273e0001" in s -> "0001"
+                s.length >= 8 -> s.substring(4, 8)
+                else -> "????"
             }
         }
 
@@ -314,6 +331,11 @@ class MuseGattManager(
     private fun stopReconnect() {
         reconnectJob?.cancel(); reconnectJob = null
         keepAliveJob?.cancel(); keepAliveJob = null
+    }
+
+    @SuppressLint("MissingPermission")
+    fun requestStatus() {
+        writeCtrl(encodeCmd("s"))
     }
 
     @SuppressLint("MissingPermission")

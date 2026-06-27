@@ -1,6 +1,8 @@
 package com.musebridge.osc
 
+import android.content.Context
 import android.util.Log
+import com.musebridge.net.UdpNetworkBinding
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import java.net.DatagramPacket
@@ -42,13 +44,14 @@ class OscSender(
     /**
      * Start the UDP sender coroutine. Safe to call multiple times.
      */
-    fun start() {
+    fun start(context: Context) {
         if (running) return
         running = true
         packetCount = 0
         dropCount = 0
 
         socket = DatagramSocket()
+        UdpNetworkBinding.bindToWifi(context, socket!!)
         // Larger buffer: 256 elements to tolerate brief network pauses
         val ch = Channel<ByteArray>(256)
         sendChannel = ch

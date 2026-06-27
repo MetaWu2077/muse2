@@ -76,6 +76,8 @@ class MainActivity : AppCompatActivity() {
 
         setupDeviceList()
         setupButtons()
+        applyLocalTargetFromInput()
+        binding.tvLocalIp.text = "Phone IP: ${getWifiIpAddress()} (Target must be PC IP)"
         observeState()
 
         // Request battery optimization and auto-start scan
@@ -158,8 +160,8 @@ class MainActivity : AppCompatActivity() {
                 viewModel.setMeditation(false)
                 Toast.makeText(this, "Session Saved", Toast.LENGTH_SHORT).show()
             } else {
-                // Check server status before starting
-                if (!state.cloudConnected) {
+                val localOn = binding.switchLocalMode.isChecked
+                if (!state.cloudConnected && !localOn) {
                     MaterialAlertDialogBuilder(this)
                         .setTitle("Server Offline")
                         .setMessage("The cloud server is currently unreachable. Your session will be saved locally and uploaded later when the connection is restored.")
@@ -180,21 +182,42 @@ class MainActivity : AppCompatActivity() {
             true
         }
 
-        // Local mode toggle — sends OSC to desktop instead of cloud
+        // Local mode — OSC to desktop
         binding.switchLocalMode.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked) applyLocalTargetFromInput()
             viewModel.setLocalMode(isChecked)
-            if (isChecked) {
-                Toast.makeText(this, "Local Mode: sending to " + viewModel.getLocalTarget(),
-                    Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "Cloud Mode", Toast.LENGTH_SHORT).show()
-            }
+            Toast.makeText(
+                this,
+                if (isChecked) "Local → ${viewModel.getLocalTarget()} (press GO)" else "Cloud Mode",
+                Toast.LENGTH_SHORT
+            ).show()
         }
 
-        // Tap the label to change local target IP
-        binding.switchLocalMode.setOnLongClickListener {
-            showLocalTargetDialog()
-            true
+        binding.etLocalTarget.setOnEditorActionListener { _, _, _ ->
+            applyLocalTargetFromInput()
+            if (binding.switchLocalMode.isChecked) {
+                viewModel.setLocalMode(true)
+            }
+            false
+        }
+    }
+
+    private fun applyLocalTargetFromInput() {
+        val raw = binding.etLocalTarget.text.toString().trim()
+        val parts = raw.split(":")
+        val host = parts.getOrElse(0) { "192.168.2.5" }
+        val port = parts.getOrElse(1) { "5000" }.toIntOrNull() ?: 5000
+        viewModel.updateLocalTarget(host, port)
+    }
+
+    private fun getWifiIpAddress(): String {
+        return try {
+            NetworkInterface.getNetworkInterfaces()?.toList()
+                ?.flatMap { it.inetAddresses.toList() }
+                ?.firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
+                ?.hostAddress ?: "--"
+        } catch (_: Exception) {
+            "--"
         }
     }
 
@@ -334,31 +357,6 @@ class MainActivity : AppCompatActivity() {
     private fun onDeviceSelected(device: BleDevice) {
         binding.rvDevices.visibility = View.GONE
         viewModel.connectToDevice(device)
-    }
-
-    private fun showLocalTargetDialog() {
-        val current = viewModel.getLocalTarget()
-        val parts = current.split(":")
-        val currentHost = parts.getOrElse(0) { "192.168.2.5" }
-        val currentPort = parts.getOrElse(1) { "5000" }
-
-        val input = android.widget.EditText(this)
-        input.setText(currentHost)
-        input.hint = "192.168.x.x"
-
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Local Target IP")
-            .setMessage("Enter the desktop IP shown in Muse Local Server header (orange text).\nPort: $currentPort")
-            .setView(input)
-            .setPositiveButton("Save") { _, _ ->
-                val newHost = input.text.toString().trim()
-                if (newHost.isNotEmpty()) {
-                    viewModel.updateLocalTarget(newHost, currentPort.toIntOrNull() ?: 5000)
-                    Toast.makeText(this, "Target: $newHost:$currentPort", Toast.LENGTH_SHORT).show()
-                }
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
     }
 
     private fun hasBlePermissions(): Boolean {
