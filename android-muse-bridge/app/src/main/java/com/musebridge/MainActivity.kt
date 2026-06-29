@@ -2,8 +2,6 @@ package com.musebridge
 
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -14,8 +12,6 @@ import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.widget.Toast
-import java.net.Inet4Address
-import java.net.NetworkInterface
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -70,14 +66,12 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         viewModel = ViewModelProvider(
-            this,
+            application as MuseApp,
             ViewModelProvider.AndroidViewModelFactory.getInstance(application)
         )[MainViewModel::class.java]
 
         setupDeviceList()
         setupButtons()
-        applyLocalTargetFromInput()
-        binding.tvLocalIp.text = "Phone IP: ${getWifiIpAddress()} (Target must be PC IP)"
         observeState()
 
         // Request battery optimization and auto-start scan
@@ -157,11 +151,18 @@ class MainActivity : AppCompatActivity() {
         binding.btnAction.setOnClickListener {
             val state = viewModel.uiState.value
             if (state.isMeditating) {
+                val completion = viewModel.captureSessionCompletion()
                 viewModel.setMeditation(false)
-                Toast.makeText(this, "Session Saved", Toast.LENGTH_SHORT).show()
+                startActivity(
+                    MeditationJournalActivity.newIntent(
+                        this,
+                        completion.sessionId,
+                        completion.durationSeconds,
+                        completion.deviceName
+                    )
+                )
             } else {
-                val localOn = binding.switchLocalMode.isChecked
-                if (!state.cloudConnected && !localOn) {
+                if (!state.cloudConnected) {
                     MaterialAlertDialogBuilder(this)
                         .setTitle("Server Offline")
                         .setMessage("The cloud server is currently unreachable. Your session will be saved locally and uploaded later when the connection is restored.")
@@ -180,44 +181,6 @@ class MainActivity : AppCompatActivity() {
         binding.tvTitle.setOnLongClickListener {
             binding.svLog.visibility = if (binding.svLog.visibility == View.VISIBLE) View.GONE else View.VISIBLE
             true
-        }
-
-        // Local mode — OSC to desktop
-        binding.switchLocalMode.setOnCheckedChangeListener { _, isChecked ->
-            if (isChecked) applyLocalTargetFromInput()
-            viewModel.setLocalMode(isChecked)
-            Toast.makeText(
-                this,
-                if (isChecked) "Local → ${viewModel.getLocalTarget()} (press GO)" else "Cloud Mode",
-                Toast.LENGTH_SHORT
-            ).show()
-        }
-
-        binding.etLocalTarget.setOnEditorActionListener { _, _, _ ->
-            applyLocalTargetFromInput()
-            if (binding.switchLocalMode.isChecked) {
-                viewModel.setLocalMode(true)
-            }
-            false
-        }
-    }
-
-    private fun applyLocalTargetFromInput() {
-        val raw = binding.etLocalTarget.text.toString().trim()
-        val parts = raw.split(":")
-        val host = parts.getOrElse(0) { "192.168.2.5" }
-        val port = parts.getOrElse(1) { "5000" }.toIntOrNull() ?: 5000
-        viewModel.updateLocalTarget(host, port)
-    }
-
-    private fun getWifiIpAddress(): String {
-        return try {
-            NetworkInterface.getNetworkInterfaces()?.toList()
-                ?.flatMap { it.inetAddresses.toList() }
-                ?.firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
-                ?.hostAddress ?: "--"
-        } catch (_: Exception) {
-            "--"
         }
     }
 

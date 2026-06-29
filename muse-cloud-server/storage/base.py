@@ -20,6 +20,7 @@ class SessionInfo:
     raw_file_path: str = ""
     raw_file_size_bytes: int = 0
     total_packets: int = 0
+    journal: Optional[str] = None
     tags: Optional[Dict] = None
 
 

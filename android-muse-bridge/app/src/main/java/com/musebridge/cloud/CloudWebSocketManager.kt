@@ -10,6 +10,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.resume
 
 /**
  * Cloud WebSocket client for streaming raw Muse BLE data to the cloud server.
@@ -65,7 +66,10 @@ class CloudWebSocketManager(
     private val started = AtomicBoolean(false)
     private val forcingReconnect = AtomicBoolean(false)
     private var webSocket: WebSocket? = null
-    private var client: OkHttpClient? = null
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(30, TimeUnit.SECONDS)
+        .build()
 
     // Buffer for disconnected mode
     private val buffer = ConcurrentLinkedQueue<ByteArray>()
@@ -81,6 +85,8 @@ class CloudWebSocketManager(
     var onDisconnected: ((String) -> Unit)? = null   // reason
     var onSessionReady: ((String) -> Unit)? = null    // session_id
     var onCommand: ((String) -> Unit)? = null         // server command
+
+    private var journalContinuation: ((Boolean) -> Unit)? = null
 
     /**
      * Configure and start the WebSocket connection.
@@ -115,18 +121,13 @@ class CloudWebSocketManager(
             return
         }
 
-        val client = OkHttpClient.Builder()
-            .readTimeout(0, TimeUnit.MILLISECONDS)  // No read timeout for streaming
-            .pingInterval(30, TimeUnit.SECONDS)      // OkHttp-level ping
-            .build()
-        this.client = client
-
         val request = Request.Builder()
             .url(serverUrl)
             .build()
 
         Log.i(TAG, "Connecting to $serverUrl...")
-        webSocket = client.newWebSocket(request, wsListener)
+        val ws = httpClient.newWebSocket(request, wsListener)
+        webSocket = ws
     }
 
     /**
@@ -288,11 +289,39 @@ class CloudWebSocketManager(
     }
 
     /**
+     * Submit user meditation journal linked to a completed session.
+     */
+    suspend fun submitSessionJournal(sessionId: String, journal: String): Boolean {
+        if (!isConnected || sessionId.isBlank() || journal.isBlank()) return false
+        return withTimeout(15_000L) {
+            suspendCancellableCoroutine { cont ->
+                journalContinuation = { ok ->
+                    if (cont.isActive) cont.resume(ok)
+                }
+                cont.invokeOnCancellation { journalContinuation = null }
+                val json = JSONObject().apply {
+                    put("type", "session_journal")
+                    put("session_id", sessionId)
+                    put("journal", journal)
+                }
+                sendJson(json)
+            }
+        }
+    }
+
+    private fun completeJournalRequest(success: Boolean) {
+        journalContinuation?.invoke(success)
+        journalContinuation = null
+    }
+
+    /**
      * Request a new server session (on GO). Resets sequence numbers.
      */
     fun startMeditationSession() {
         seqNum.set(0)
         sessionId = ""
+        packetCount = 0
+        dropCount = 0
         if (!isConnected) {
             Log.w(TAG, "Cannot start session — not connected")
             return
@@ -313,7 +342,11 @@ class CloudWebSocketManager(
     // ── OkHttp WebSocket Listener ───────────────────────────────
 
     private val wsListener = object : WebSocketListener() {
+        private fun isCurrent(webSocket: WebSocket): Boolean =
+            webSocket === this@CloudWebSocketManager.webSocket
+
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (!isCurrent(webSocket)) return
             Log.i(TAG, "WebSocket opened: ${response.message}")
             isConnected = true
             reconnectAttempt = 0
@@ -325,11 +358,15 @@ class CloudWebSocketManager(
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (!isCurrent(webSocket)) return
             try {
                 val msg = JSONObject(text)
                 val type = msg.optString("type", "")
 
                 when (type) {
+                    "connected" -> {
+                        Log.i(TAG, "Server ready (idle)")
+                    }
                     "hello_ack" -> {
                         sessionId = msg.getString("session_id")
                         Log.i(TAG, "Session ready: $sessionId")
@@ -339,6 +376,14 @@ class CloudWebSocketManager(
                     }
                     "session_ended" -> {
                         Log.i(TAG, "Server confirmed session end: ${msg.optString("session_id")}")
+                    }
+                    "journal_ack" -> {
+                        Log.i(TAG, "Journal saved for ${msg.optString("session_id")}")
+                        completeJournalRequest(true)
+                    }
+                    "journal_error" -> {
+                        Log.w(TAG, "Journal error: ${msg.optString("error")}")
+                        completeJournalRequest(false)
                     }
                     "pong" -> {
                         // Heartbeat acknowledged
@@ -358,15 +403,18 @@ class CloudWebSocketManager(
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (!isCurrent(webSocket)) return
             Log.d(TAG, "Received binary message: ${bytes.size} bytes")
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            if (!isCurrent(webSocket)) return
             Log.i(TAG, "WebSocket closing: $code $reason")
             webSocket.close(1000, null)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (!isCurrent(webSocket)) return
             Log.i(TAG, "WebSocket closed: $code $reason")
             isConnected = false
             sessionId = ""
@@ -380,6 +428,7 @@ class CloudWebSocketManager(
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (!isCurrent(webSocket)) return
             Log.e(TAG, "WebSocket failure: ${t.message}", t)
             isConnected = false
             sessionId = ""

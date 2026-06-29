@@ -5,6 +5,7 @@ Session manager: create, track, and clean up streaming sessions.
 import asyncio
 import datetime
 import logging
+import os
 import uuid
 from typing import Dict, Optional
 
@@ -104,6 +105,29 @@ class SessionManager:
                     session_id, ctx.packet_count,
                     summary.get('duration_seconds', 0))
         return summary
+
+    async def update_journal(self, session_id: str, journal: str) -> bool:
+        """Attach user meditation notes to a completed session."""
+        journal = (journal or "").strip()
+        if not session_id or not journal:
+            return False
+
+        if self.db is not None:
+            ok = await self.db.update_session_journal(session_id, journal)
+            if ok:
+                logger.info("Session %s journal saved (%d chars)", session_id, len(journal))
+                return True
+
+        # File-only fallback
+        path = os.path.join(config.STORAGE_DIR, f"{session_id}.journal.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(journal)
+            logger.info("Session %s journal saved to file (%d chars)", session_id, len(journal))
+            return True
+        except OSError as e:
+            logger.warning("Failed to save journal for %s: %s", session_id, e)
+            return False
 
     async def _timeout_loop(self) -> None:
         """

@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_packets INT DEFAULT 0,
     firmware_version VARCHAR(16) DEFAULT '',
     battery_start_pct INT DEFAULT NULL,
+    journal TEXT DEFAULT NULL COMMENT 'User meditation practice notes after session',
     tags JSON DEFAULT NULL,
     INDEX idx_started_at (started_at),
     INDEX idx_device_address (device_address)

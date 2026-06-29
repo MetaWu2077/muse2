@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'amused-src'))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.responses import Response, HTMLResponse
+from pydantic import BaseModel, Field
 
 import config
 from session_manager import SessionManager
@@ -190,12 +191,13 @@ async def ws_session(ws: WebSocket):
     Phone → Cloud streaming endpoint.
 
     Protocol:
-      1. Phone sends hello JSON: {"type":"hello","device":"MuseS-xxx","preset":"p1034"}
-      2. Server responds: {"type":"hello_ack","session_id":"abc123","server_time":"..."}
-      3. Phone sends binary frames at ~100/sec
-      4. Phone sends heartbeat every few seconds: {"type":"heartbeat"}
-      5. Phone sends session_end when meditation finishes: {"type":"session_end"}
-      6. Phone may send another hello to start a new session on the same connection
+      1. Server accepts connection and sends {"type":"connected"}
+      2. Phone may send heartbeat: {"type":"heartbeat"} → pong
+      3. On GO, phone sends hello: {"type":"hello","device":"MuseS-xxx","preset":"p1034"}
+      4. Server responds: {"type":"hello_ack","session_id":"abc123",...}
+      5. Phone sends binary frames at ~100/sec
+      6. Phone sends session_end when meditation finishes
+      7. Phone may send another hello to start a new session on the same connection
     """
     async def _start_session_from_hello(hello: dict):
         nonlocal session_ctx
@@ -225,16 +227,13 @@ async def ws_session(ws: WebSocket):
     await ws.accept()
     session_ctx = None
 
+    # Idle connection — session starts when phone sends hello (on GO).
+    await ws.send_text(json.dumps({
+        "type": "connected",
+        "server_time": datetime.datetime.now().isoformat(),
+    }))
+
     try:
-        # ── Hello handshake (first message) ──
-        hello_raw = await ws.receive_text()
-        hello = json.loads(hello_raw)
-        if hello.get("type") != "hello":
-            await ws.close(1008, "Expected hello")
-            return
-
-        session_ctx = await _start_session_from_hello(hello)
-
         # ── Main receive loop ──
         while True:
             data = await ws.receive()
@@ -243,12 +242,11 @@ async def ws_session(ws: WebSocket):
                 msg = json.loads(data["text"])
                 msg_type = msg.get("type", "")
 
-                if msg_type == "heartbeat":
-                    await ws.send_text(json.dumps({"type": "pong"}))
-
-                elif msg_type == "hello":
-                    # New meditation session on an existing WebSocket connection
+                if msg_type == "hello":
                     session_ctx = await _start_session_from_hello(msg)
+
+                elif msg_type == "heartbeat":
+                    await ws.send_text(json.dumps({"type": "pong"}))
 
                 elif msg_type == "session_end":
                     if session_ctx:
@@ -279,6 +277,28 @@ async def ws_session(ws: WebSocket):
                                         _ongoing_generations.discard(report_path)
                                         logger.warning("[%s] report generation failed: %s",
                                                         ended_id, e)
+
+                elif msg_type == "session_journal":
+                    sid = (msg.get("session_id") or "").strip()
+                    journal = (msg.get("journal") or "").strip()
+                    if sid and journal:
+                        ok = await session_manager.update_journal(sid, journal)
+                        if ok:
+                            await ws.send_text(json.dumps({
+                                "type": "journal_ack",
+                                "session_id": sid,
+                            }))
+                        else:
+                            await ws.send_text(json.dumps({
+                                "type": "journal_error",
+                                "session_id": sid,
+                                "error": "session not found",
+                            }))
+                    else:
+                        await ws.send_text(json.dumps({
+                            "type": "journal_error",
+                            "error": "session_id and journal required",
+                        }))
 
                 elif msg_type == "status":
                     logger.debug("[%s] status: %s",
@@ -573,6 +593,10 @@ async def get_session(session_id: str):
     if session_manager.db is not None:
         s = await session_manager.db.get_session(session_id)
         if s:
+            if not s.get("journal"):
+                sidecar = _read_journal_sidecar(session_id)
+                if sidecar:
+                    s["journal"] = sidecar
             return s
 
     # File-only mode: read .bin file info
@@ -591,7 +615,32 @@ async def get_session(session_id: str):
         "total_packets": 0,
         "raw_file_path": filepath,
         "raw_file_size_bytes": size,
+        "journal": _read_journal_sidecar(session_id),
     }
+
+
+class SessionJournalBody(BaseModel):
+    journal: str = Field(..., min_length=1, max_length=20000)
+
+
+@app.post("/api/sessions/{session_id}/journal")
+async def post_session_journal(session_id: str, body: SessionJournalBody):
+    """Attach user meditation notes to a completed session."""
+    ok = await session_manager.update_journal(session_id, body.journal)
+    if not ok:
+        raise HTTPException(404, "Session not found or journal empty")
+    return {"session_id": session_id, "ok": True}
+
+
+def _read_journal_sidecar(session_id: str) -> Optional[str]:
+    path = os.path.join(config.STORAGE_DIR, f"{session_id}.journal.txt")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 @app.get("/api/sessions/{session_id}/heartrate")

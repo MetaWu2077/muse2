@@ -12,8 +12,6 @@ import com.musebridge.MuseApp
 import com.musebridge.gatt.ConnectionState
 import com.musebridge.gatt.MuseGattManager
 import com.musebridge.gatt.MuseGatt
-import com.musebridge.osc.OscSender
-import com.musebridge.osc.RawUdpSender
 import com.musebridge.cloud.CloudWebSocketManager
 import com.musebridge.parser.DataDecoder
 import com.musebridge.parser.MuseStatusParser
@@ -33,6 +31,12 @@ data class SignalQuality(
     val af7: Float = 0f,
     val af8: Float = 0f,
     val tp10: Float = 0f
+)
+
+data class SessionCompletionInfo(
+    val sessionId: String,
+    val durationSeconds: Long,
+    val deviceName: String
 )
 
 data class UiState(
@@ -57,8 +61,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val museApp = app as MuseApp
     val scanner = BleScanner(museApp)
     val gattManager = MuseGattManager(app, log = { appendLog(it) })
-    val oscSender = OscSender(viewModelScope)
-    val rawUdpSender = RawUdpSender(viewModelScope)
     val cloudWs = CloudWebSocketManager(viewModelScope)
     private val storage = OfflineStorageManager(app)
 
@@ -77,11 +79,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var wifiLock: WifiManager.WifiLock? = null
     private var releaseWakelocksJob: kotlinx.coroutines.Job? = null
     private var sessionHadCloudIssues = false
-
-    // Local mode
-    private var localHost = "192.168.2.5"
-    private var localPort = 5000
-    private var localModeEnabled = false
+    private var currentSessionBackupFile: String? = null
     private var statusPollJob: Job? = null
 
     init {
@@ -174,7 +172,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         cloudWs.onConnected = {
             _uiState.update { it.copy(cloudConnected = true) }
             appendLog("Cloud: connected (idle — press GO to start session)")
-            if (_uiState.value.isMeditating && !localModeEnabled) {
+            if (_uiState.value.isMeditating) {
                 cloudWs.startMeditationSession()
             }
         }
@@ -199,9 +197,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        // Cloud reachability only when not in local mode
+        // Cloud reachability
         val url = _uiState.value.cloudUrl
-        if (url.isNotBlank() && !localModeEnabled) {
+        if (url.isNotBlank()) {
             cloudWs.connect(url, "Zen-User", "p1034")
         }
     }
@@ -232,8 +230,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun disconnect() {
         gattManager.disconnect()
-        rawUdpSender.stop()
-        oscSender.stop()
         cloudWs.disconnect()
         releaseWakeLocks()
         _uiState.update { it.copy(signalQuality = SignalQuality(), batteryPercent = 0f,
@@ -296,74 +292,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.update { it.copy(cloudUrl = url) }
     }
 
-    // Local mode target (configurable IP:port)
-    fun getLocalTarget(): String = "$localHost:$localPort"
+    fun captureSessionCompletion(): SessionCompletionInfo {
+        return SessionCompletionInfo(
+            sessionId = _uiState.value.cloudSessionId.ifEmpty { cloudWs.sessionId },
+            durationSeconds = _uiState.value.meditationDurationSeconds,
+            deviceName = _uiState.value.connectedDeviceName
+        )
+    }
 
-    fun updateLocalTarget(host: String, port: Int) {
-        localHost = host
-        localPort = port
-        try {
-            rawUdpSender.configure(host, port)
-            oscSender.configure(host, port)
-            val ctx = getApplication<Application>()
-            if (rawUdpSender.isRunning) {
-                rawUdpSender.stop()
-                rawUdpSender.start(ctx)
-            }
-            if (oscSender.isRunning) {
-                oscSender.stop()
-                oscSender.start(ctx)
-            }
-            appendLog("Local target: $host:$port (raw + OSC)")
+    suspend fun submitSessionJournal(sessionId: String, journal: String): Boolean {
+        return try {
+            cloudWs.submitSessionJournal(sessionId, journal)
         } catch (e: Exception) {
-            appendLog("Local target error: ${e.message}")
-            Log.e("MainViewModel", "Invalid local target $host:$port", e)
+            appendLog("Journal submit failed: ${e.message}")
+            false
         }
     }
 
-    fun setLocalMode(enabled: Boolean) {
-        localModeEnabled = enabled
-        if (enabled) {
-            rawUdpSender.configure(localHost, localPort)
-            oscSender.configure(localHost, localPort)
-            cloudWs.disconnect()
-            _uiState.update { it.copy(cloudConnected = false, cloudSessionId = "") }
-            appendLog("Local Mode armed → $localHost:$localPort (press GO)")
-        } else {
-            rawUdpSender.stop()
-            oscSender.stop()
-            appendLog("Local Mode OFF")
-            val url = _uiState.value.cloudUrl
-            if (url.isNotBlank() && !cloudWs.isConnected) {
-                cloudWs.connect(url, "Zen-User", "p1034")
-            }
-        }
-    }
-
-    private fun startLocalStreaming() {
-        if (!localModeEnabled) return
-        if (localHost.isBlank()) {
-            appendLog("Local target IP is empty")
-            return
-        }
-        try {
-            rawUdpSender.configure(localHost, localPort)
-            oscSender.configure(localHost, localPort)
-        } catch (e: Exception) {
-            appendLog("Local target invalid: ${e.message}")
-            return
-        }
-        val ctx = getApplication<Application>()
-        rawUdpSender.start(ctx)
-        oscSender.start(ctx)
-        appendLog("Local stream → $localHost:$localPort (raw BLE + OSC)")
-    }
-
-    private fun stopLocalStreaming() {
-        if (!localModeEnabled) return
-        rawUdpSender.stop()
-        oscSender.stop()
-        appendLog("Local stream stopped")
+    fun saveOfflineJournal(journal: String): Boolean {
+        val prefs = getApplication<Application>().getSharedPreferences("muse_journal", Context.MODE_PRIVATE)
+        val key = "pending_${System.currentTimeMillis()}"
+        prefs.edit().putString(key, journal).apply()
+        appendLog("Journal saved locally ($key)")
+        return true
     }
 
     fun setMeditation(active: Boolean) {
@@ -374,42 +325,52 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             sessionHadCloudIssues = false
             acquireWakeLocks()
             startTimer()
-            storage.startSession()
-            startLocalStreaming()
+            currentSessionBackupFile = storage.startSession()
 
-            if (!localModeEnabled) {
-                if (_uiState.value.cloudConnected) {
-                    cloudWs.startMeditationSession()
-                    appendLog("Cloud: requesting new session...")
-                } else {
-                    sessionHadCloudIssues = true
-                    appendLog("Server is offline. Saving locally...")
-                }
+            if (_uiState.value.cloudConnected) {
+                cloudWs.startMeditationSession()
+                appendLog("Cloud: requesting new session...")
+            } else {
+                sessionHadCloudIssues = true
+                appendLog("Server is offline. Saving locally...")
             }
         } else {
             stopTimer()
             storage.endSession()
-            stopLocalStreaming()
             appendLog("Zen session ended")
 
-            if (!localModeEnabled && _uiState.value.cloudConnected) {
+            if (_uiState.value.cloudConnected) {
                 cloudWs.endMeditationSession()
                 _uiState.update { it.copy(cloudSessionId = "") }
                 appendLog("Cloud: session ended")
             }
 
-            if (!sessionHadCloudIssues && _uiState.value.cloudConnected && cloudWs.dropCount == 0L) {
-                val files = storage.getPendingFiles()
-                if (files.isNotEmpty()) {
-                    storage.deleteFile(files.last())
-                    appendLog("Cloud OK — removed redundant local backup")
+            val cloudSynced = _uiState.value.cloudConnected &&
+                cloudWs.packetCount > 0 &&
+                !sessionHadCloudIssues &&
+                cloudWs.dropCount == 0L
+
+            if (cloudSynced) {
+                currentSessionBackupFile?.let { name ->
+                    storage.getPendingFiles()
+                        .find { it.name == name }
+                        ?.let {
+                            storage.deleteFile(it)
+                            appendLog("Cloud OK — removed redundant local backup")
+                        }
                 }
             } else {
-                appendLog("Local backup retained (cloud drops=${cloudWs.dropCount})")
+                appendLog(
+                    "Local backup retained (cloud pkts=${cloudWs.packetCount}, " +
+                        "drops=${cloudWs.dropCount}, issues=$sessionHadCloudIssues)"
+                )
             }
+            currentSessionBackupFile = null
 
             releaseWakeLocks()
-            checkAndUploadOfflineData()
+            if (!cloudSynced) {
+                checkAndUploadOfflineData()
+            }
         }
     }
 
@@ -436,6 +397,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 if (cloudWs.sessionId.isEmpty()) {
                     appendLog("Upload aborted — no cloud session for ${file.name}")
+                    cloudWs.endMeditationSession()
                     break
                 }
 
@@ -514,61 +476,36 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     appendLog("SENSOR: ${data.size}B, ${subpackets.size} subpkts")
                 }
 
-                val streamingLocal = localModeEnabled && _uiState.value.isMeditating
                 for (sp in subpackets) {
                     if (sp.hasEeg && sp.eeg != null) {
                         val ch = sp.eegChannels
                         val ns = sp.eegSamples
-                        if (streamingLocal && oscSender.isRunning) {
-                            val batch = FloatArray(ns * 5)
-                            for (s in 0 until ns) {
-                                for (c in 0 until minOf(ch, 5)) {
-                                    batch[s * 5 + c] = sp.eeg[s * ch + c]
-                                }
-                            }
-                            oscSender.sendFloats("/muse/eeg", batch)
-                        }
                         for (c in 0 until minOf(ch, 4)) {
                             accumulateEeg(c, floatArrayOf(sp.eeg[(ns - 1) * ch + c]))
                         }
                         updateSignalQuality()
                     }
-                    if (streamingLocal && sp.hasAccGyro) {
-                        sp.accel?.let { oscSender.sendFloats("/muse/acc", it) }
-                        sp.gyro?.let { oscSender.sendFloats("/muse/gyro", it) }
-                    }
-                    if (streamingLocal && sp.hasPpg && sp.ppg != null) {
-                        oscSender.sendFloats("/muse/ppg", sp.ppg)
-                    }
                 }
 
                 if (!_uiState.value.isMeditating) return
 
-                if (localModeEnabled) {
-                    if (!rawUdpSender.isRunning) {
-                        appendLog("WARN: raw sender not running — press GO again")
-                        return
-                    }
-                    rawUdpSender.send(data)
-                } else {
-                    storage.savePacket(data)
-                    if (uiState.value.cloudConnected && cloudWs.sessionId.isNotEmpty()) {
+                storage.savePacket(data)
+                when {
+                    uiState.value.cloudConnected && cloudWs.sessionId.isNotEmpty() -> {
                         if (!cloudWs.sendPacket(data)) {
                             sessionHadCloudIssues = true
                         }
-                    } else {
-                        sessionHadCloudIssues = true
                     }
+                    uiState.value.cloudConnected && cloudWs.sessionId.isEmpty() -> {
+                        // Waiting for hello_ack — local backup only, not a sync failure
+                    }
+                    else -> sessionHadCloudIssues = true
                 }
             }
         }
 
         if (packetCounter % 50 == 0) {
             val info = when {
-                localModeEnabled && _uiState.value.isMeditating ->
-                    "raw:${rawUdpSender.packetCount} osc:${oscSender.packetCount} → $localHost:$localPort"
-                localModeEnabled ->
-                    "armed (press GO) → $localHost:$localPort"
                 _uiState.value.isMeditating ->
                     "cloud: ${cloudWs.packetCount} pkt"
                 else ->
@@ -661,8 +598,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         super.onCleared()
         releaseWakeLocks()
         gattManager.disconnect()
-        rawUdpSender.stop()
-        oscSender.stop()
         cloudWs.disconnect()
         scanner.stopScan()
     }

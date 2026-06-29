@@ -117,6 +117,7 @@ class MySQLBackend(StorageBackend):
                 total_packets INT DEFAULT 0,
                 firmware_version VARCHAR(16) DEFAULT '',
                 battery_start_pct INT DEFAULT NULL,
+                journal TEXT DEFAULT NULL,
                 tags JSON DEFAULT NULL,
                 INDEX idx_started_at (started_at),
                 INDEX idx_device_address (device_address)
@@ -153,6 +154,22 @@ class MySQLBackend(StorageBackend):
             ) ENGINE=InnoDB""",
         ]
         await self._run_sync(lambda cur: [cur.execute(s) for s in ddl])
+        await self._ensure_journal_column()
+
+    async def _ensure_journal_column(self) -> None:
+        """Add journal column to existing deployments."""
+        def _do(cur):
+            cur.execute(
+                """SELECT COUNT(*) FROM information_schema.COLUMNS
+                   WHERE TABLE_SCHEMA=%s AND TABLE_NAME='sessions'
+                   AND COLUMN_NAME='journal'""",
+                (self.database,)
+            )
+            if cur.fetchone()[0] == 0:
+                cur.execute(
+                    "ALTER TABLE sessions ADD COLUMN journal TEXT DEFAULT NULL"
+                )
+        await self._run_sync(_do)
 
     # ── Session CRUD ──────────────────────────────────────────
 
@@ -182,6 +199,15 @@ class MySQLBackend(StorageBackend):
             (ended_at, total_packets, raw_file_path,
              raw_file_size_bytes, session_id)
         ))
+
+    async def update_session_journal(self, session_id: str, journal: str) -> bool:
+        def _do(cur):
+            cur.execute(
+                "UPDATE sessions SET journal=%s WHERE session_id=%s",
+                (journal, session_id),
+            )
+            return cur.rowcount > 0
+        return await self._run_sync(_do)
 
     async def write_heart_rate(self, session_id: str,
                                 time: datetime, bpm: float) -> None:
@@ -213,7 +239,7 @@ class MySQLBackend(StorageBackend):
             cur.execute(
                 """SELECT session_id, device_address, device_name, preset,
                           started_at, ended_at, total_packets, raw_file_path,
-                          raw_file_size_bytes
+                          raw_file_size_bytes, journal
                    FROM sessions WHERE session_id=%s""",
                 (session_id,)
             )
@@ -227,7 +253,7 @@ class MySQLBackend(StorageBackend):
             cur.execute(
                 """SELECT session_id, device_address, device_name, preset,
                           started_at, ended_at, total_packets, raw_file_path,
-                          raw_file_size_bytes
+                          raw_file_size_bytes, journal
                    FROM sessions ORDER BY started_at DESC LIMIT %s OFFSET %s""",
                 (limit, offset)
             )
@@ -275,7 +301,7 @@ class MySQLBackend(StorageBackend):
 _SESSION_KEYS = [
     "session_id", "device_address", "device_name", "preset",
     "started_at", "ended_at", "total_packets", "raw_file_path",
-    "raw_file_size_bytes"
+    "raw_file_size_bytes", "journal",
 ]
 
 
